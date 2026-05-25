@@ -16,6 +16,9 @@ xattr = "1"
 plist = "1"
 nucleo = "0.5"
 git2 = { version = "0.19", features = ["vendored-openssl"] }
+portable-pty = "0.8"
+vte = "0.13"
+anyhow = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"

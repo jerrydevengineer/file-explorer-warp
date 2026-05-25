@@ -229,6 +229,7 @@ impl App {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         let config = AppConfig::load();
         apply_theme(&cc.egui_ctx, config.theme);
+        crate::platform::fonts::setup_fonts(&cc.egui_ctx);
         let bookmarks = Bookmarks::load();
         let start_path = config
             .last_path
