@@ -227,7 +227,8 @@ pub struct App {
     git_panel: GitPanelState,
     // ── Terminal panel ────────────────────────────────────────────────────────
     terminal_open: bool,
-    terminal: Option<TerminalState>,
+    terminals: Vec<TerminalState>,
+    terminal_active: usize,
     terminal_last_sync_path: Option<PathBuf>,
 }
 
@@ -274,7 +275,8 @@ impl App {
             git_panel_open: false,
             git_panel: GitPanelState::default(),
             terminal_open: false,
-            terminal: None,
+            terminals: Vec::new(),
+            terminal_active: 0,
             terminal_last_sync_path: None,
         }
     }
@@ -295,11 +297,11 @@ impl App {
         if self.terminal_open {
             self.terminal_open = false;
         } else {
-            if self.terminal.is_none() {
+            if self.terminals.is_empty() {
                 let cwd = self.focused_pane().active().current_path.clone();
                 let ctx2 = ctx.clone();
                 match TerminalState::spawn(80, 24, &cwd, Arc::new(move || ctx2.request_repaint())) {
-                    Ok(t) => { self.terminal = Some(t); }
+                    Ok(t) => { self.terminals.push(t); self.terminal_active = 0; }
                     Err(_) => { return; }
                 }
             }
@@ -936,7 +938,7 @@ impl eframe::App for App {
         }
 
         // ── Terminal CWD sync (terminal → browser) ────────────────────────────
-        let maybe_new_cwd: Option<PathBuf> = self.terminal.as_ref()
+        let maybe_new_cwd: Option<PathBuf> = self.terminals.get(self.terminal_active)
             .and_then(|t| t.grid.lock().ok())
             .and_then(|mut g| g.take_cwd_update());
         if let Some(new_cwd) = maybe_new_cwd {
@@ -948,11 +950,11 @@ impl eframe::App for App {
         }
 
         // ── Browser → terminal CWD sync ───────────────────────────────────────
-        if self.terminal_open {
+        if self.terminal_open && !self.terminals.is_empty() {
             let current_path = self.focused_pane().active().current_path.clone();
             let last = self.terminal_last_sync_path.clone();
             if last.as_ref().map_or(false, |l| l != &current_path) {
-                if let Some(ref mut term) = self.terminal {
+                if let Some(term) = self.terminals.get_mut(self.terminal_active) {
                     let escaped = current_path.to_string_lossy().replace('\'', "'\\''");
                     term.write_input(format!("cd '{}'\r", escaped).as_bytes());
                 }
@@ -1134,24 +1136,50 @@ impl eframe::App for App {
         }
 
         // ── Terminal panel ────────────────────────────────────────────────────
-        if self.terminal_open {
-            // Capture what the closure needs from self before taking &mut self.terminal
+        if self.terminal_open && !self.terminals.is_empty() {
             let fallback_cwd = self.focused_pane().active().current_path.clone();
             let terminal_app_pref = self.config.terminal;
             let panel_height = self.config.terminal_panel_height;
-            if let Some(ref mut terminal) = self.terminal {
-                egui::TopBottomPanel::bottom("terminal_panel")
-                    .exact_height(panel_height)
-                    .resizable(false)
-                    .show(ctx, |ui| {
-                        if let Some(TerminalPanelEvent::OpenInTerminal) = terminal_panel::show(ui, terminal) {
-                            let cwd = terminal.grid.lock().ok()
+            let active = self.terminal_active;
+            egui::TopBottomPanel::bottom("terminal_panel")
+                .exact_height(panel_height)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    match terminal_panel::show(ui, &mut self.terminals, active) {
+                        Some(TerminalPanelEvent::OpenInTerminal) => {
+                            let cwd = self.terminals.get(active)
+                                .and_then(|t| t.grid.lock().ok())
                                 .and_then(|g| g.cwd.clone())
                                 .unwrap_or_else(|| fallback_cwd.clone());
                             opener::open_in_terminal(&cwd, terminal_app_pref);
                         }
-                    });
-            }
+                        Some(TerminalPanelEvent::NewTab) => {
+                            let cwd = self.focused_pane().active().current_path.clone();
+                            let ctx2 = ctx.clone();
+                            if let Ok(t) = TerminalState::spawn(80, 24, &cwd, Arc::new(move || ctx2.request_repaint())) {
+                                self.terminals.push(t);
+                                self.terminal_active = self.terminals.len() - 1;
+                                self.terminal_last_sync_path = None;
+                            }
+                        }
+                        Some(TerminalPanelEvent::CloseTab(idx)) => {
+                            self.terminals.remove(idx);
+                            if self.terminals.is_empty() {
+                                self.terminal_open = false;
+                            } else {
+                                if self.terminal_active >= self.terminals.len() {
+                                    self.terminal_active = self.terminals.len() - 1;
+                                }
+                                self.terminal_last_sync_path = None;
+                            }
+                        }
+                        Some(TerminalPanelEvent::SwitchTab(idx)) => {
+                            self.terminal_active = idx;
+                            self.terminal_last_sync_path = None;
+                        }
+                        None => {}
+                    }
+                });
         }
 
         // ── Central panel — sidebar + manual split ───────────────────────────

@@ -89,9 +89,17 @@ impl TerminalGrid {
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
+        // Build new grid and copy existing content rather than wiping it.
+        // This preserves previous command output when the panel is resized.
+        let mut new_cells = vec![vec![TerminalCell::default(); cols]; rows];
+        let copy_rows = rows.min(self.cells.len());
+        for r in 0..copy_rows {
+            let copy_cols = cols.min(self.cells[r].len());
+            new_cells[r][..copy_cols].clone_from_slice(&self.cells[r][..copy_cols]);
+        }
         self.cols = cols;
         self.rows = rows;
-        self.cells = vec![vec![TerminalCell::default(); cols]; rows];
+        self.cells = new_cells;
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
         self.scroll_top = 0;
