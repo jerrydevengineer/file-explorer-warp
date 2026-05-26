@@ -23,6 +23,7 @@ pub enum TerminalApp {
 fn default_sidebar_width() -> f32 { 200.0 }
 fn default_git_panel_height() -> f32 { 260.0 }
 fn default_git_panel_width() -> f32 { 380.0 }
+fn default_terminal_panel_height() -> f32 { 220.0 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -40,6 +41,8 @@ pub struct AppConfig {
     pub git_panel_right: bool,
     #[serde(default = "default_git_panel_width")]
     pub git_panel_width: f32,
+    #[serde(default = "default_terminal_panel_height")]
+    pub terminal_panel_height: f32,
 }
 
 impl Default for AppConfig {
@@ -53,6 +56,7 @@ impl Default for AppConfig {
             git_panel_height: default_git_panel_height(),
             git_panel_right: false,
             git_panel_width: default_git_panel_width(),
+            terminal_panel_height: default_terminal_panel_height(),
         }
     }
 }

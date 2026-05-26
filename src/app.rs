@@ -11,12 +11,14 @@ use crate::core::{
 };
 use crate::git::{repo as git_repo, graph as git_graph, diff as git_diff, operations as git_ops};
 use crate::platform::{clipboard, opener, quicklook, share};
+use crate::core::terminal::TerminalState;
 use crate::ui::{
     file_list::{self, FileListAction, FileListState},
     git_panel::{self, GitPanelAction, GitPanelState},
     sidebar::{self, SidebarAction},
     search_overlay,
     tab_bar,
+    terminal_panel::{self, TerminalPanelEvent},
     toasts::Toasts,
     prefs,
 };
@@ -223,6 +225,10 @@ pub struct App {
     git_checked_path: Option<PathBuf>, // last path we ran detect_repo on
     git_panel_open: bool,
     git_panel: GitPanelState,
+    // ── Terminal panel ────────────────────────────────────────────────────────
+    terminal_open: bool,
+    terminal: Option<TerminalState>,
+    terminal_last_sync_path: Option<PathBuf>,
 }
 
 impl App {
@@ -267,6 +273,9 @@ impl App {
             git_checked_path: None,
             git_panel_open: false,
             git_panel: GitPanelState::default(),
+            terminal_open: false,
+            terminal: None,
+            terminal_last_sync_path: None,
         }
     }
 
@@ -279,6 +288,23 @@ impl App {
             self.git_panel.graph    = git_graph::build_graph(wd, 300);
             self.git_panel.diff     = None;
             self.git_panel.diff_file = None;
+        }
+    }
+
+    fn toggle_terminal(&mut self, ctx: &egui::Context) {
+        if self.terminal_open {
+            self.terminal_open = false;
+        } else {
+            if self.terminal.is_none() {
+                let cwd = self.focused_pane().active().current_path.clone();
+                let ctx2 = ctx.clone();
+                match TerminalState::spawn(80, 24, &cwd, Arc::new(move || ctx2.request_repaint())) {
+                    Ok(t) => { self.terminal = Some(t); }
+                    Err(_) => { return; }
+                }
+            }
+            self.terminal_open = true;
+            self.terminal_last_sync_path = None;
         }
     }
 
@@ -740,6 +766,7 @@ impl eframe::App for App {
         let mut kb_switch_tab: Option<usize> = None;
         let mut kb_open_search = false;
         let mut kb_toggle_git = false;
+        let mut kb_toggle_terminal = false;
         let mut kb_open_prefs = false;
         let mut kb_quicklook = false;
         let mut kb_copy_file = false;
@@ -759,6 +786,7 @@ impl eframe::App for App {
             if i.modifiers.command && i.key_pressed(egui::Key::Backslash) { kb_close_right = true; }
             if i.modifiers.command && i.key_pressed(egui::Key::F) { kb_open_search = true; }
             if i.modifiers.command && i.key_pressed(egui::Key::G) { kb_toggle_git = true; }
+            if i.modifiers.command && i.key_pressed(egui::Key::J) { kb_toggle_terminal = true; }
             if i.modifiers.command && i.key_pressed(egui::Key::N) { kb_new_window = true; }
             if i.modifiers.command && i.key_pressed(egui::Key::Comma) { kb_open_prefs = true; }
             // Backspace = go up; Cmd+Backspace = move to Trash
@@ -900,6 +928,37 @@ impl eframe::App for App {
                 if self.git_panel_open {
                     self.refresh_git();
                 }
+            }
+        }
+
+        if kb_toggle_terminal {
+            self.toggle_terminal(ctx);
+        }
+
+        // ── Terminal CWD sync (terminal → browser) ────────────────────────────
+        let maybe_new_cwd: Option<PathBuf> = self.terminal.as_ref()
+            .and_then(|t| t.grid.lock().ok())
+            .and_then(|mut g| g.take_cwd_update());
+        if let Some(new_cwd) = maybe_new_cwd {
+            if new_cwd.exists() {
+                let h = self.config.show_hidden;
+                self.focused_pane_mut().active_mut().navigate(new_cwd.clone(), h);
+                self.terminal_last_sync_path = Some(new_cwd);
+            }
+        }
+
+        // ── Browser → terminal CWD sync ───────────────────────────────────────
+        if self.terminal_open {
+            let current_path = self.focused_pane().active().current_path.clone();
+            let last = self.terminal_last_sync_path.clone();
+            if last.as_ref().map_or(false, |l| l != &current_path) {
+                if let Some(ref mut term) = self.terminal {
+                    let escaped = current_path.to_string_lossy().replace('\'', "'\\''");
+                    term.write_input(format!("cd '{}'\r", escaped).as_bytes());
+                }
+                self.terminal_last_sync_path = Some(current_path);
+            } else if last.is_none() {
+                self.terminal_last_sync_path = Some(current_path);
             }
         }
 
@@ -1050,6 +1109,11 @@ impl eframe::App for App {
                     }
                 }
                 ui.separator();
+                let term_label = if self.terminal_open { "Terminal ▾" } else { "Terminal ▸" };
+                if ui.button(term_label).on_hover_text("Toggle terminal panel (⌘J)").clicked() {
+                    self.toggle_terminal(ctx);
+                }
+                ui.separator();
                 if ui.button("⚙").on_hover_text("Preferences (⌘,)").clicked() {
                     self.prefs_open = true;
                 }
@@ -1065,6 +1129,27 @@ impl eframe::App for App {
                     .show(ctx, |ui| {
                         let actions = git_panel::show(ui, &wd, &mut self.git_panel, false);
                         self.handle_git_actions(actions, &wd);
+                    });
+            }
+        }
+
+        // ── Terminal panel ────────────────────────────────────────────────────
+        if self.terminal_open {
+            // Capture what the closure needs from self before taking &mut self.terminal
+            let fallback_cwd = self.focused_pane().active().current_path.clone();
+            let terminal_app_pref = self.config.terminal;
+            let panel_height = self.config.terminal_panel_height;
+            if let Some(ref mut terminal) = self.terminal {
+                egui::TopBottomPanel::bottom("terminal_panel")
+                    .exact_height(panel_height)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        if let Some(TerminalPanelEvent::OpenInTerminal) = terminal_panel::show(ui, terminal) {
+                            let cwd = terminal.grid.lock().ok()
+                                .and_then(|g| g.cwd.clone())
+                                .unwrap_or_else(|| fallback_cwd.clone());
+                            opener::open_in_terminal(&cwd, terminal_app_pref);
+                        }
                     });
             }
         }
@@ -1231,8 +1316,28 @@ impl eframe::App for App {
             };
             ui.painter().vline(sb_div_x, total_rect.y_range(), egui::Stroke::new(1.0, sb_div_color));
 
+            // ── Terminal panel resize handle ──────────────────────────────────
+            if self.terminal_open {
+                let div_rect = egui::Rect::from_min_max(
+                    egui::pos2(full_rect.left(), full_rect.bottom() - 3.0),
+                    egui::pos2(full_rect.right(), full_rect.bottom() + 3.0),
+                );
+                let div_id = ui.id().with("terminal_panel_divider");
+                let div_resp = ui.interact(div_rect, div_id, egui::Sense::drag());
+                if div_resp.dragged() {
+                    let dy = div_resp.drag_delta().y;
+                    self.config.terminal_panel_height = (self.config.terminal_panel_height - dy).clamp(80.0, 600.0);
+                }
+                if div_resp.drag_stopped() {
+                    self.config.save();
+                }
+                if div_resp.hovered() || div_resp.dragged() {
+                    ctx.set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                }
+            }
+
             // ── Git panel resize handle (bottom position only) ────────────────
-            if self.git_panel_open && !self.config.git_panel_right {
+            if self.git_panel_open && !self.config.git_panel_right && !self.terminal_open {
                 let div_rect = egui::Rect::from_min_max(
                     egui::pos2(full_rect.left(), full_rect.bottom() - 3.0),
                     egui::pos2(full_rect.right(), full_rect.bottom() + 3.0),

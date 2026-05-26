@@ -5,3 +5,4 @@ pub mod search_overlay;
 pub mod git_panel;
 pub mod toasts;
 pub mod prefs;
+pub mod terminal_panel;
