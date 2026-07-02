@@ -16,6 +16,8 @@ pub enum FileListAction {
     GetInfo(PathBuf),
     StartCreating(CreateKind),
     CreateItem(CreateKind, String),
+    StartRename(PathBuf),
+    RenameItem(PathBuf, String), // (old_path, new_name)
     CopyFile(PathBuf),
     CutFile(PathBuf),
     PasteHere,
@@ -37,11 +39,18 @@ pub struct CreatingItem {
     pub needs_focus: bool,
 }
 
+pub struct RenamingItem {
+    pub path: PathBuf,
+    pub name: String,
+    pub needs_focus: bool,
+}
+
 pub struct FileListState {
     pub selected: Option<PathBuf>,
     pub sort_col: SortColumn,
     pub sort_order: SortOrder,
     pub creating: Option<CreatingItem>,
+    pub renaming: Option<RenamingItem>,
 }
 
 impl Default for FileListState {
@@ -51,6 +60,7 @@ impl Default for FileListState {
             sort_col: SortColumn::Name,
             sort_order: SortOrder::Ascending,
             creating: None,
+            renaming: None,
         }
     }
 }
@@ -301,6 +311,15 @@ pub fn show(
             }
         }
 
+        // Enter on selected file starts inline rename (only when no edit is already active)
+        if state.renaming.is_none() && state.creating.is_none() {
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if let Some(sel) = state.selected.clone() {
+                    actions.push(FileListAction::StartRename(sel));
+                }
+            }
+        }
+
         // ".." up-directory row
         if let Some(parent) = current_path.parent() {
             let parent_path = parent.to_path_buf();
@@ -345,183 +364,235 @@ pub fn show(
                 && row_response.hovered()
                 && dragging_path.map_or(true, |p| p != &entry.path);
 
+            let is_renaming = state.renaming.as_ref().map_or(false, |r| r.path == entry.path);
+            // Carries (confirmed, cancelled, new_name) out of the visibility block.
+            let mut rename_result: Option<(bool, bool, String)> = None;
+
             if ui.is_rect_visible(row_rect) {
                 draw_row_bg(ui, row_rect, is_selected || is_dir_drop_target, row_response.hovered());
 
-                let text_color = if is_cut {
-                    ui.visuals().weak_text_color()
-                } else if is_selected {
-                    ui.visuals().selection.stroke.color
+                if is_renaming {
+                    // Draw icon first with painter, then put TextEdit on top.
+                    // Order matters: draw_row_bg → painter icon → ui.put(TextEdit).
+                    ui.painter().text(
+                        egui::pos2(row_rect.left() + 4.0, row_rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        format!("  {}  ", icon),
+                        body_font.clone(),
+                        ui.visuals().text_color(),
+                    );
+                    let text_rect = egui::Rect::from_min_max(
+                        egui::pos2(row_rect.left() + 32.0, row_rect.top() + 2.0),
+                        egui::pos2(row_rect.right() - 4.0, row_rect.bottom() - 2.0),
+                    );
+                    let resp = {
+                        let r = state.renaming.as_mut().unwrap();
+                        let resp = ui.put(text_rect, egui::TextEdit::singleline(&mut r.name));
+                        if r.needs_focus {
+                            resp.request_focus();
+                            r.needs_focus = false;
+                        }
+                        resp
+                    };
+                    let confirmed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let cancelled = resp.lost_focus() && !confirmed;
+                    let new_name = state.renaming.as_ref().unwrap().name.clone();
+                    rename_result = Some((confirmed, cancelled, new_name));
                 } else {
-                    ui.visuals().text_color()
-                };
-                let small_color = if is_cut || !is_selected {
-                    ui.visuals().weak_text_color()
-                } else {
-                    text_color
-                };
-
-                let name_text = if is_cut {
-                    format!("  {}  {} (cut)", icon, entry.name)
-                } else {
-                    format!("  {}  {}", icon, entry.name)
-                };
-                paint_cell(ui, row_rect, col_x[0], &name_text, &body_font, text_color);
-                paint_cell(ui, row_rect, col_x[1], &entry.size_display(), &small_font, small_color);
-                paint_cell(ui, row_rect, col_x[2], &entry.kind.to_string(), &small_font, small_color);
-                paint_cell(ui, row_rect, col_x[3], &entry.modified_display(), &small_font, small_color);
-
-                // Render tag color chips
-                if !entry.tags.is_empty() {
-                    let chip_r = 4.0_f32;
-                    let chip_spacing = chip_r * 2.0 + 3.0;
-                    let n = entry.tags.len() as f32;
-                    let total_w = n * (chip_r * 2.0) + (n - 1.0) * 3.0;
-                    let start_x = row_rect.left() + col_x[1] - total_w - 6.0;
-                    let cy = row_rect.center().y;
-                    for (ci, tag) in entry.tags.iter().enumerate() {
-                        let cx = start_x + ci as f32 * chip_spacing + chip_r;
-                        let (r, g, b) = tag.color.rgb();
-                        ui.painter().circle_filled(
-                            egui::pos2(cx, cy),
-                            chip_r,
-                            egui::Color32::from_rgb(r, g, b),
-                        );
-                    }
-                }
-            }
-
-            if row_response.drag_started() {
-                actions.push(FileListAction::DragStarted(entry.path.clone()));
-            }
-
-            // Drop dragged file onto a directory in the same pane
-            if is_dir_drop_target && pointer_released {
-                if let Some(from) = dragging_path {
-                    actions.push(FileListAction::MoveItem(from.clone(), entry.path.clone()));
-                }
-            }
-
-            if row_response.clicked() {
-                state.selected = Some(entry.path.clone());
-                // Surrender keyboard focus so file-row clicks don't block Cmd+C/X/V shortcuts.
-                ui.memory_mut(|m| m.surrender_focus(row_id));
-            }
-            if row_response.double_clicked() {
-                match entry.kind {
-                    FileKind::Directory => {
-                        actions.push(FileListAction::Navigate(entry.path.clone()))
-                    }
-                    _ => actions.push(FileListAction::OpenFile(entry.path.clone())),
-                }
-            }
-
-            row_response.context_menu(|ui| {
-                if ui.button("Quick Look").on_hover_text("Preview (Space)").clicked() {
-                    actions.push(FileListAction::QuickLook(entry.path.clone()));
-                    ui.close_menu();
-                }
-                if ui.button("Share…").clicked() {
-                    actions.push(FileListAction::Share(entry.path.clone()));
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui.button("Copy  ⌘C").clicked() {
-                    actions.push(FileListAction::CopyFile(entry.path.clone()));
-                    ui.close_menu();
-                }
-                if ui.button("Cut   ⌘X").clicked() {
-                    actions.push(FileListAction::CutFile(entry.path.clone()));
-                    ui.close_menu();
-                }
-                if has_clipboard && ui.button("Paste ⌘V").clicked() {
-                    actions.push(FileListAction::PasteHere);
-                    ui.close_menu();
-                }
-                ui.separator();
-                ui.menu_button("Tags", |ui| {
-                    if global_tags.items.is_empty() {
-                        ui.label(
-                            egui::RichText::new("No tags — create in sidebar")
-                                .small()
-                                .weak()
-                                .italics(),
-                        );
+                    let text_color = if is_cut {
+                        ui.visuals().weak_text_color()
+                    } else if is_selected {
+                        ui.visuals().selection.stroke.color
                     } else {
-                        for global_tag in &global_tags.items {
-                            let has_tag = entry.tags.iter().any(|t| t.name == global_tag.name);
-                            let text = if has_tag {
-                                format!("✓  {}", global_tag.name)
-                            } else {
-                                format!("    {}", global_tag.name)
-                            };
-                            let (r, g, b) = global_tag.rgb();
-                            let dot_color = egui::Color32::from_rgb(r, g, b);
-                            let btn = ui.button(text);
+                        ui.visuals().text_color()
+                    };
+                    let small_color = if is_cut || !is_selected {
+                        ui.visuals().weak_text_color()
+                    } else {
+                        text_color
+                    };
+
+                    let name_text = if is_cut {
+                        format!("  {}  {} (cut)", icon, entry.name)
+                    } else {
+                        format!("  {}  {}", icon, entry.name)
+                    };
+                    paint_cell(ui, row_rect, col_x[0], &name_text, &body_font, text_color);
+                    paint_cell(ui, row_rect, col_x[1], &entry.size_display(), &small_font, small_color);
+                    paint_cell(ui, row_rect, col_x[2], &entry.kind.to_string(), &small_font, small_color);
+                    paint_cell(ui, row_rect, col_x[3], &entry.modified_display(), &small_font, small_color);
+
+                    // Render tag color chips
+                    if !entry.tags.is_empty() {
+                        let chip_r = 4.0_f32;
+                        let chip_spacing = chip_r * 2.0 + 3.0;
+                        let n = entry.tags.len() as f32;
+                        let total_w = n * (chip_r * 2.0) + (n - 1.0) * 3.0;
+                        let start_x = row_rect.left() + col_x[1] - total_w - 6.0;
+                        let cy = row_rect.center().y;
+                        for (ci, tag) in entry.tags.iter().enumerate() {
+                            let cx = start_x + ci as f32 * chip_spacing + chip_r;
+                            let (r, g, b) = tag.color.rgb();
                             ui.painter().circle_filled(
-                                egui::pos2(btn.rect.left() + 8.0, btn.rect.center().y),
-                                4.0,
-                                dot_color,
+                                egui::pos2(cx, cy),
+                                chip_r,
+                                egui::Color32::from_rgb(r, g, b),
                             );
-                            if btn.clicked() {
-                                let mut new_tags = entry.tags.clone();
-                                if has_tag {
-                                    new_tags.retain(|t| t.name != global_tag.name);
-                                } else {
-                                    new_tags.push(crate::core::tags::Tag {
-                                        name: global_tag.name.clone(),
-                                        color: crate::core::tags::TagColor::from_number(
-                                            global_tag.color,
-                                        ),
-                                    });
-                                }
-                                actions.push(FileListAction::SetTags(
-                                    entry.path.clone(),
-                                    new_tags,
-                                ));
-                                ui.close_menu();
-                            }
                         }
                     }
+                }
+            }
+
+            // Apply rename result after the visibility block (borrows on state are released).
+            if let Some((confirmed, cancelled, new_name)) = rename_result {
+                if confirmed {
+                    if !new_name.trim().is_empty() {
+                        actions.push(FileListAction::RenameItem(entry.path.clone(), new_name));
+                    }
+                    state.renaming = None;
+                } else if cancelled {
+                    state.renaming = None;
+                }
+            }
+
+            if !is_renaming {
+                if row_response.drag_started() {
+                    actions.push(FileListAction::DragStarted(entry.path.clone()));
+                }
+
+                // Drop dragged file onto a directory in the same pane
+                if is_dir_drop_target && pointer_released {
+                    if let Some(from) = dragging_path {
+                        actions.push(FileListAction::MoveItem(from.clone(), entry.path.clone()));
+                    }
+                }
+
+                if row_response.clicked() {
+                    state.selected = Some(entry.path.clone());
+                    // Surrender keyboard focus so file-row clicks don't block Cmd+C/X/V shortcuts.
+                    ui.memory_mut(|m| m.surrender_focus(row_id));
+                }
+                if row_response.double_clicked() {
+                    match entry.kind {
+                        FileKind::Directory => {
+                            actions.push(FileListAction::Navigate(entry.path.clone()))
+                        }
+                        _ => actions.push(FileListAction::OpenFile(entry.path.clone())),
+                    }
+                }
+
+                row_response.context_menu(|ui| {
+                    if ui.button("Quick Look").on_hover_text("Preview (Space)").clicked() {
+                        actions.push(FileListAction::QuickLook(entry.path.clone()));
+                        ui.close_menu();
+                    }
+                    if ui.button("Share…").clicked() {
+                        actions.push(FileListAction::Share(entry.path.clone()));
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Rename").clicked() {
+                        actions.push(FileListAction::StartRename(entry.path.clone()));
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Copy  ⌘C").clicked() {
+                        actions.push(FileListAction::CopyFile(entry.path.clone()));
+                        ui.close_menu();
+                    }
+                    if ui.button("Cut   ⌘X").clicked() {
+                        actions.push(FileListAction::CutFile(entry.path.clone()));
+                        ui.close_menu();
+                    }
+                    if has_clipboard && ui.button("Paste ⌘V").clicked() {
+                        actions.push(FileListAction::PasteHere);
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    ui.menu_button("Tags", |ui| {
+                        if global_tags.items.is_empty() {
+                            ui.label(
+                                egui::RichText::new("No tags — create in sidebar")
+                                    .small()
+                                    .weak()
+                                    .italics(),
+                            );
+                        } else {
+                            for global_tag in &global_tags.items {
+                                let has_tag = entry.tags.iter().any(|t| t.name == global_tag.name);
+                                let text = if has_tag {
+                                    format!("✓  {}", global_tag.name)
+                                } else {
+                                    format!("    {}", global_tag.name)
+                                };
+                                let (r, g, b) = global_tag.rgb();
+                                let dot_color = egui::Color32::from_rgb(r, g, b);
+                                let btn = ui.button(text);
+                                ui.painter().circle_filled(
+                                    egui::pos2(btn.rect.left() + 8.0, btn.rect.center().y),
+                                    4.0,
+                                    dot_color,
+                                );
+                                if btn.clicked() {
+                                    let mut new_tags = entry.tags.clone();
+                                    if has_tag {
+                                        new_tags.retain(|t| t.name != global_tag.name);
+                                    } else {
+                                        new_tags.push(crate::core::tags::Tag {
+                                            name: global_tag.name.clone(),
+                                            color: crate::core::tags::TagColor::from_number(
+                                                global_tag.color,
+                                            ),
+                                        });
+                                    }
+                                    actions.push(FileListAction::SetTags(
+                                        entry.path.clone(),
+                                        new_tags,
+                                    ));
+                                    ui.close_menu();
+                                }
+                            }
+                        }
+                    });
+                    ui.separator();
+                    if ui.button("Copy Path").clicked() {
+                        actions.push(FileListAction::CopyPath(entry.path.clone()));
+                        ui.close_menu();
+                    }
+                    if ui.button("Add to Bookmarks").clicked() {
+                        actions.push(FileListAction::AddBookmark(entry.path.clone()));
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Reveal in Finder").clicked() {
+                        actions.push(FileListAction::RevealInFinder(entry.path.clone()));
+                        ui.close_menu();
+                    }
+                    if ui.button("Open in Terminal").clicked() {
+                        actions.push(FileListAction::OpenInTerminal(entry.path.clone()));
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Get Info").clicked() {
+                        actions.push(FileListAction::GetInfo(entry.path.clone()));
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Move to Trash  ⌘Delete").clicked() {
+                        actions.push(FileListAction::DeleteFile(entry.path.clone()));
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("New File").clicked() {
+                        actions.push(FileListAction::StartCreating(CreateKind::File));
+                        ui.close_menu();
+                    }
+                    if ui.button("New Folder").clicked() {
+                        actions.push(FileListAction::StartCreating(CreateKind::Directory));
+                        ui.close_menu();
+                    }
                 });
-                ui.separator();
-                if ui.button("Copy Path").clicked() {
-                    actions.push(FileListAction::CopyPath(entry.path.clone()));
-                    ui.close_menu();
-                }
-                if ui.button("Add to Bookmarks").clicked() {
-                    actions.push(FileListAction::AddBookmark(entry.path.clone()));
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui.button("Reveal in Finder").clicked() {
-                    actions.push(FileListAction::RevealInFinder(entry.path.clone()));
-                    ui.close_menu();
-                }
-                if ui.button("Open in Terminal").clicked() {
-                    actions.push(FileListAction::OpenInTerminal(entry.path.clone()));
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui.button("Get Info").clicked() {
-                    actions.push(FileListAction::GetInfo(entry.path.clone()));
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui.button("Move to Trash  ⌘Delete").clicked() {
-                    actions.push(FileListAction::DeleteFile(entry.path.clone()));
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui.button("New File").clicked() {
-                    actions.push(FileListAction::StartCreating(CreateKind::File));
-                    ui.close_menu();
-                }
-                if ui.button("New Folder").clicked() {
-                    actions.push(FileListAction::StartCreating(CreateKind::Directory));
-                    ui.close_menu();
-                }
-            });
+            }
         }
 
         // Right-clickable empty space below the last file row.

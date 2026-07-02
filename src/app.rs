@@ -67,9 +67,11 @@ impl TabState {
             self.history.push(path.clone());
             self.history_pos = self.history.len() - 1;
             self.current_path = path;
-            // Tag filter is scoped to a directory; clear it on navigation.
+            // Tag filter and in-progress rename/create are scoped to a directory.
             self.tag_filter = None;
             self.tag_search_results = None;
+            self.list_state.renaming = None;
+            self.list_state.creating = None;
             self.reload(show_hidden);
             true
         } else {
@@ -230,6 +232,11 @@ pub struct App {
     terminals: Vec<TerminalState>,
     terminal_active: usize,
     terminal_last_sync_path: Option<PathBuf>,
+    // ── External drag ─────────────────────────────────────────────────────────
+    #[cfg(target_os = "macos")]
+    external_drag_active: bool,
+    #[cfg(target_os = "macos")]
+    pending_reload: Option<(std::time::Instant, Vec<std::path::PathBuf>)>,
 }
 
 impl App {
@@ -278,6 +285,10 @@ impl App {
             terminals: Vec::new(),
             terminal_active: 0,
             terminal_last_sync_path: None,
+            #[cfg(target_os = "macos")]
+            external_drag_active: false,
+            #[cfg(target_os = "macos")]
+            pending_reload: None,
         }
     }
 
@@ -400,6 +411,7 @@ impl App {
                 FileListAction::Share(path) => share::show_share_sheet(&path),
                 FileListAction::GetInfo(path) => opener::get_info(&path),
                 FileListAction::StartCreating(_) | FileListAction::CreateItem(_, _) => {}
+                FileListAction::StartRename(_) | FileListAction::RenameItem(_, _) => {}
                 FileListAction::CopyFile(_) | FileListAction::CutFile(_) | FileListAction::PasteHere => {}
                 FileListAction::DeleteFile(path) => {
                     let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -436,6 +448,7 @@ impl App {
     fn handle_creating_actions(
         actions: Vec<FileListAction>,
         tab: &mut TabState,
+        toasts: &mut Toasts,
     ) -> (bool, Option<PathBuf>) {
         let mut reload_needed = false;
         let mut select_after: Option<PathBuf> = None;
@@ -456,6 +469,27 @@ impl App {
                     }
                     reload_needed = true;
                     select_after = Some(target);
+                }
+                FileListAction::StartRename(path) => {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    tab.list_state.selected = Some(path.clone());
+                    tab.list_state.renaming = Some(file_list::RenamingItem {
+                        path,
+                        name,
+                        needs_focus: true,
+                    });
+                }
+                FileListAction::RenameItem(old_path, new_name) => {
+                    let new_path = old_path.parent().unwrap_or(&old_path).join(&new_name);
+                    match std::fs::rename(&old_path, &new_path) {
+                        Ok(_) => {
+                            reload_needed = true;
+                            select_after = Some(new_path);
+                        }
+                        Err(e) => {
+                            toasts.push(format!("Rename failed: {}", e));
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -703,6 +737,55 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let pointer_released = ctx.input(|i| i.pointer.any_released());
+
+        // ── External drag-end reload ──────────────────────────────────────────
+        #[cfg(target_os = "macos")]
+        {
+            let now_active = crate::platform::drag::is_drag_active();
+            let just_ended = self.external_drag_active && !now_active;
+            self.external_drag_active = now_active;
+
+            if just_ended {
+                ctx.request_repaint();
+            }
+
+            if let Some((op, _paths)) = crate::platform::drag::take_drag_ended_op() {
+                eprintln!("[app] external drag ended op={op}");
+                if op != 0 {
+                    // op=0 → Stop → skip reload, file stays. op=16 → Finder did rename → source gone.
+                    self.pending_reload = Some((
+                        std::time::Instant::now() + std::time::Duration::from_millis(300),
+                        _paths,
+                    ));
+                    ctx.request_repaint_after(std::time::Duration::from_millis(300));
+                }
+            }
+
+            let reload_due = self.pending_reload.as_ref()
+                .map_or(false, |(d, _)| std::time::Instant::now() >= *d);
+            if reload_due {
+                if let Some((_, paths)) = self.pending_reload.take() {
+                    let h = self.config.show_hidden;
+                    // Reload every tab (in both panes) that is showing the directory
+                    // from which files were dragged — not just whichever tab is active now.
+                    let source_dirs: Vec<std::path::PathBuf> = paths.iter()
+                        .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
+                        .collect();
+                    for tab in &mut self.left.tabs {
+                        if source_dirs.iter().any(|d| d == &tab.current_path) {
+                            tab.reload(h);
+                        }
+                    }
+                    if let Some(r) = &mut self.right {
+                        for tab in &mut r.tabs {
+                            if source_dirs.iter().any(|d| d == &tab.current_path) {
+                                tab.reload(h);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // ── File drag ghost ───────────────────────────────────────────────────
         let file_dragging_name = self.left.active().dragging_path.as_ref()
@@ -1439,9 +1522,9 @@ impl eframe::App for App {
                 let left_ai = self.left.active_tab;
                 let terminal = self.config.terminal;
                 let (left_special, left_regular): (Vec<_>, Vec<_>) = left_file_actions.into_iter()
-                    .partition(|a| matches!(a, FileListAction::StartCreating(_) | FileListAction::CreateItem(_, _) | FileListAction::CopyFile(_) | FileListAction::CutFile(_) | FileListAction::PasteHere));
+                    .partition(|a| matches!(a, FileListAction::StartCreating(_) | FileListAction::CreateItem(_, _) | FileListAction::StartRename(_) | FileListAction::RenameItem(_, _) | FileListAction::CopyFile(_) | FileListAction::CutFile(_) | FileListAction::PasteHere));
                 let (left_creating, left_clipboard): (Vec<_>, Vec<_>) = left_special.into_iter()
-                    .partition(|a| matches!(a, FileListAction::StartCreating(_) | FileListAction::CreateItem(_, _)));
+                    .partition(|a| matches!(a, FileListAction::StartCreating(_) | FileListAction::CreateItem(_, _) | FileListAction::StartRename(_) | FileListAction::RenameItem(_, _)));
                 let (left_nav, left_reload, left_ql, left_sel_nav, left_clear_tag) = Self::handle_file_actions(
                     left_regular,
                     &mut self.bookmarks,
@@ -1449,7 +1532,7 @@ impl eframe::App for App {
                     terminal,
                     &mut self.left.tabs[self.left.active_tab].dragging_path,
                 );
-                let (left_create_reload, left_create_sel) = Self::handle_creating_actions(left_creating, &mut self.left.tabs[left_ai]);
+                let (left_create_reload, left_create_sel) = Self::handle_creating_actions(left_creating, &mut self.left.tabs[left_ai], &mut self.toasts);
                 let left_paste_dir = self.left.tabs[left_ai].current_path.clone();
                 let (left_clip_reload, left_clip_sel) = Self::handle_clipboard_actions(left_clipboard, &mut self.clipboard_op, &left_paste_dir, &mut self.toasts);
                 let left_select = left_create_sel.or(left_clip_sel);
@@ -1499,9 +1582,9 @@ impl eframe::App for App {
                 let right_ai = self.right.as_ref().map(|r| r.active_tab).unwrap_or(0);
                 let terminal = self.config.terminal;
                 let (right_special, right_regular): (Vec<_>, Vec<_>) = right_file_actions.into_iter()
-                    .partition(|a| matches!(a, FileListAction::StartCreating(_) | FileListAction::CreateItem(_, _) | FileListAction::CopyFile(_) | FileListAction::CutFile(_) | FileListAction::PasteHere));
+                    .partition(|a| matches!(a, FileListAction::StartCreating(_) | FileListAction::CreateItem(_, _) | FileListAction::StartRename(_) | FileListAction::RenameItem(_, _) | FileListAction::CopyFile(_) | FileListAction::CutFile(_) | FileListAction::PasteHere));
                 let (right_creating, right_clipboard): (Vec<_>, Vec<_>) = right_special.into_iter()
-                    .partition(|a| matches!(a, FileListAction::StartCreating(_) | FileListAction::CreateItem(_, _)));
+                    .partition(|a| matches!(a, FileListAction::StartCreating(_) | FileListAction::CreateItem(_, _) | FileListAction::StartRename(_) | FileListAction::RenameItem(_, _)));
                 let (right_nav, right_reload, right_ql, right_sel_nav, right_clear_tag) = Self::handle_file_actions(
                     right_regular,
                     &mut self.bookmarks,
@@ -1509,7 +1592,7 @@ impl eframe::App for App {
                     terminal,
                     &mut self.right.as_mut().unwrap().tabs[right_ai].dragging_path,
                 );
-                let (right_create_reload, right_create_sel) = Self::handle_creating_actions(right_creating, self.right.as_mut().unwrap().tabs.get_mut(right_ai).unwrap());
+                let (right_create_reload, right_create_sel) = Self::handle_creating_actions(right_creating, self.right.as_mut().unwrap().tabs.get_mut(right_ai).unwrap(), &mut self.toasts);
                 let right_paste_dir = self.right.as_ref().map(|r| r.tabs[right_ai].current_path.clone()).unwrap_or_default();
                 let (right_clip_reload, right_clip_sel) = Self::handle_clipboard_actions(right_clipboard, &mut self.clipboard_op, &right_paste_dir, &mut self.toasts);
                 let right_select = right_create_sel.or(right_clip_sel);
@@ -1584,9 +1667,9 @@ impl eframe::App for App {
                 let left_ai = self.left.active_tab;
                 let terminal = self.config.terminal;
                 let (left_special, left_regular): (Vec<_>, Vec<_>) = left_file_actions.into_iter()
-                    .partition(|a| matches!(a, FileListAction::StartCreating(_) | FileListAction::CreateItem(_, _) | FileListAction::CopyFile(_) | FileListAction::CutFile(_) | FileListAction::PasteHere));
+                    .partition(|a| matches!(a, FileListAction::StartCreating(_) | FileListAction::CreateItem(_, _) | FileListAction::StartRename(_) | FileListAction::RenameItem(_, _) | FileListAction::CopyFile(_) | FileListAction::CutFile(_) | FileListAction::PasteHere));
                 let (left_creating, left_clipboard): (Vec<_>, Vec<_>) = left_special.into_iter()
-                    .partition(|a| matches!(a, FileListAction::StartCreating(_) | FileListAction::CreateItem(_, _)));
+                    .partition(|a| matches!(a, FileListAction::StartCreating(_) | FileListAction::CreateItem(_, _) | FileListAction::StartRename(_) | FileListAction::RenameItem(_, _)));
                 let (left_nav, left_reload, left_ql, left_sel_nav, left_clear_tag) = Self::handle_file_actions(
                     left_regular,
                     &mut self.bookmarks,
@@ -1594,7 +1677,7 @@ impl eframe::App for App {
                     terminal,
                     &mut self.left.tabs[left_ai].dragging_path,
                 );
-                let (left_create_reload, left_create_sel) = Self::handle_creating_actions(left_creating, &mut self.left.tabs[left_ai]);
+                let (left_create_reload, left_create_sel) = Self::handle_creating_actions(left_creating, &mut self.left.tabs[left_ai], &mut self.toasts);
                 let left_paste_dir = self.left.tabs[left_ai].current_path.clone();
                 let (left_clip_reload, left_clip_sel) = Self::handle_clipboard_actions(left_clipboard, &mut self.clipboard_op, &left_paste_dir, &mut self.toasts);
                 let left_select = left_create_sel.or(left_clip_sel);
@@ -1704,6 +1787,47 @@ impl eframe::App for App {
                 }
                 Err(e) => { self.toasts.push(format!("Move failed: {}", e)); }
             }
+        }
+
+        // ── External drag: trigger when cursor leaves the window ──────────────
+        #[cfg(target_os = "macos")]
+        if let Some(dragging_path) = self.left.active().dragging_path.clone()
+            .or_else(|| self.right.as_ref().and_then(|r| r.active().dragging_path.clone()))
+        {
+            let window_rect = ctx.screen_rect();
+            let cursor_left = ctx.input(|i| {
+                i.pointer.hover_pos()
+                    .map_or(false, |p| !window_rect.contains(p))
+            });
+            if cursor_left {
+                crate::platform::drag::begin_external_drag(&[dragging_path.as_path()]);
+                self.left.active_mut().dragging_path = None;
+                if let Some(r) = &mut self.right { r.active_mut().dragging_path = None; }
+            }
+        }
+
+        // ── Drop from Finder into the focused pane ────────────────────────────
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if !dropped.is_empty() {
+            let dest_dir = self.focused_pane().active().current_path.clone();
+            let h = self.config.show_hidden;
+            for file in &dropped {
+                if let Some(src) = &file.path {
+                    if let Some(name) = src.file_name() {
+                        let dest = dest_dir.join(name);
+                        if src.is_dir() {
+                            // Ignore partial-failure: copy_path_recursive creates the
+                            // destination directory via create_dir_all before recursing,
+                            // so even a failed copy leaves a (possibly empty) directory
+                            // on disk. Always reload so the listing reflects reality.
+                            let _ = copy_path_recursive(src, &dest);
+                        } else {
+                            let _ = std::fs::copy(src, &dest);
+                        }
+                    }
+                }
+            }
+            self.focused_pane_mut().active_mut().reload(h);
         }
 
         // ── Clear file drag state ─────────────────────────────────────────────

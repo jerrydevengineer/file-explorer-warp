@@ -31,6 +31,11 @@ objc2-app-kit = { version = "0.2", features = [
     "NSResponder",
     "NSView",
     "NSWindow",
+    "NSDragging",
+    "NSDraggingItem",
+    "NSDraggingSession",
+    "NSEvent",
+    "NSImage",
 ] }
 objc2-foundation = "0.2"
 
