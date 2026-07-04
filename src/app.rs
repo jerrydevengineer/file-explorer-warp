@@ -863,7 +863,14 @@ impl eframe::App for App {
         // otherwise Backspace in a TextEdit would also navigate up a directory.
         // wants_keyboard_input() is true only when a TextEdit is actively receiving text,
         // NOT just because an interactive widget (like a file row) has focus.
-        let no_text_focus = !ctx.wants_keyboard_input();
+        // Additionally check if the terminal grid has focus: it uses a custom Sense
+        // (not a TextEdit) so wants_keyboard_input() is blind to it, but bare-key
+        // shortcuts (Backspace → go_up, Space → quicklook) must not fire there either.
+        let terminal_has_focus = self.terminal_open && !self.terminals.is_empty() && {
+            let terminal_grid_id = egui::Id::new("terminal_panel").with("terminal_grid");
+            ctx.memory(|m| m.has_focus(terminal_grid_id))
+        };
+        let no_text_focus = !ctx.wants_keyboard_input() && !terminal_has_focus;
 
         ctx.input(|i| {
             if i.modifiers.command && i.key_pressed(egui::Key::T) { kb_new_tab = true; }

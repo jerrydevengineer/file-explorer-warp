@@ -201,7 +201,10 @@ pub fn show(
 
     // ── Allocate the grid rect ────────────────────────────────────────────────
     let grid_size = Vec2::new(cols as f32 * char_w, rows as f32 * char_h);
-    let (rect, response) = ui.allocate_exact_size(grid_size, Sense::click_and_drag());
+    // Use an explicit stable ID (not auto-generated) so focus survives layout
+    // changes in the header (e.g. CWD label appearing after first shell output).
+    let (rect, _) = ui.allocate_exact_size(grid_size, Sense::hover());
+    let response = ui.interact(rect, ui.id().with("terminal_grid"), Sense::click_and_drag());
 
     // Focus on click or drag start
     if response.clicked() || response.drag_started() {
@@ -242,6 +245,20 @@ pub fn show(
 
     // ── Keyboard input ────────────────────────────────────────────────────────
     if has_focus {
+        // Lock all navigation keys to this widget so egui's internal focus
+        // navigation doesn't consume them before our input_mut block runs.
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                response.id,
+                egui::EventFilter {
+                    tab: true,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    escape: true,
+                },
+            );
+        });
+
         let mut to_send: Vec<u8> = Vec::new();
 
         ui.input_mut(|input| {
