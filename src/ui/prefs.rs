@@ -1,11 +1,12 @@
 use egui::RichText;
 use crate::core::config::{AppConfig, Theme, TerminalApp};
+use crate::core::themes::CustomTheme;
 
 pub struct PrefsAction {
     pub config_changed: bool,
 }
 
-pub fn show(ctx: &egui::Context, open: &mut bool, config: &mut AppConfig) -> PrefsAction {
+pub fn show(ctx: &egui::Context, open: &mut bool, config: &mut AppConfig, themes: &[CustomTheme]) -> PrefsAction {
     let mut action = PrefsAction { config_changed: false };
 
     egui::Window::new("Preferences")
@@ -27,14 +28,40 @@ pub fn show(ctx: &egui::Context, open: &mut bool, config: &mut AppConfig) -> Pre
                 ui.label("Theme:");
                 ui.add_space(8.0);
                 for (label, variant) in [("System", Theme::System), ("Light", Theme::Light), ("Dark", Theme::Dark)] {
-                    if ui.selectable_label(config.theme == variant, label).clicked() {
-                        if config.theme != variant {
+                    let selected = config.theme == variant && config.custom_theme.is_none();
+                    if ui.selectable_label(selected, label).clicked() {
+                        if config.theme != variant || config.custom_theme.is_some() {
                             config.theme = variant;
+                            config.custom_theme = None;
                             action.config_changed = true;
                         }
                     }
                 }
             });
+
+            if !themes.is_empty() {
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    for theme in themes {
+                        let accent = egui::Color32::from_rgb(
+                            theme.colors.accent.r,
+                            theme.colors.accent.g,
+                            theme.colors.accent.b,
+                        );
+                        let is_selected = config.custom_theme.as_deref() == Some(theme.id.as_str());
+                        let response = ui.selectable_label(is_selected, format!("   {}", theme.name));
+                        let dot = egui::Pos2::new(
+                            response.rect.min.x + 8.0,
+                            response.rect.center().y,
+                        );
+                        ui.painter().circle_filled(dot, 5.0, accent);
+                        if response.clicked() {
+                            config.custom_theme = Some(theme.id.clone());
+                            action.config_changed = true;
+                        }
+                    }
+                });
+            }
 
             ui.add_space(4.0);
 

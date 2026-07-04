@@ -232,6 +232,8 @@ pub struct App {
     terminals: Vec<TerminalState>,
     terminal_active: usize,
     terminal_last_sync_path: Option<PathBuf>,
+    // ── Custom themes ─────────────────────────────────────────────────────────
+    custom_themes: Vec<crate::core::themes::CustomTheme>,
     // ── External drag ─────────────────────────────────────────────────────────
     #[cfg(target_os = "macos")]
     external_drag_active: bool,
@@ -242,7 +244,16 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         let config = AppConfig::load();
-        apply_theme(&cc.egui_ctx, config.theme);
+        let custom_themes = crate::core::themes::load_themes();
+        if let Some(ref id) = config.custom_theme {
+            if let Some(t) = custom_themes.iter().find(|t| t.id == *id) {
+                apply_custom_theme(&cc.egui_ctx, &t.colors);
+            } else {
+                apply_theme(&cc.egui_ctx, config.theme);
+            }
+        } else {
+            apply_theme(&cc.egui_ctx, config.theme);
+        }
         crate::platform::fonts::setup_fonts(&cc.egui_ctx);
         let bookmarks = Bookmarks::load();
         let start_path = config
@@ -285,6 +296,7 @@ impl App {
             terminals: Vec::new(),
             terminal_active: 0,
             terminal_last_sync_path: None,
+            custom_themes,
             #[cfg(target_os = "macos")]
             external_drag_active: false,
             #[cfg(target_os = "macos")]
@@ -1121,10 +1133,19 @@ impl eframe::App for App {
         // ── Preferences window ───────────────────────────────────────────────
         if self.prefs_open {
             let old_theme = self.config.theme;
+            let old_custom_theme = self.config.custom_theme.clone();
             let old_hidden = self.config.show_hidden;
-            let result = prefs::show(ctx, &mut self.prefs_open, &mut self.config);
+            let result = prefs::show(ctx, &mut self.prefs_open, &mut self.config, &self.custom_themes);
             if result.config_changed {
-                if self.config.theme != old_theme {
+                if self.config.custom_theme != old_custom_theme {
+                    if let Some(ref id) = self.config.custom_theme {
+                        if let Some(t) = self.custom_themes.iter().find(|t| t.id == *id) {
+                            apply_custom_theme(ctx, &t.colors);
+                        }
+                    } else {
+                        apply_theme(ctx, self.config.theme);
+                    }
+                } else if self.config.theme != old_theme {
                     apply_theme(ctx, self.config.theme);
                 }
                 if self.config.show_hidden != old_hidden {
@@ -1929,4 +1950,68 @@ fn apply_theme(ctx: &egui::Context, theme: crate::core::config::Theme) {
         }
     };
     ctx.set_visuals(visuals);
+}
+
+fn blend_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    egui::Color32::from_rgb(
+        (a.r() as f32 + (b.r() as f32 - a.r() as f32) * t) as u8,
+        (a.g() as f32 + (b.g() as f32 - a.g() as f32) * t) as u8,
+        (a.b() as f32 + (b.b() as f32 - a.b() as f32) * t) as u8,
+    )
+}
+
+fn apply_custom_theme(ctx: &egui::Context, colors: &crate::core::themes::ThemeColors) {
+    use egui::{Color32, Stroke};
+
+    let bg     = Color32::from_rgb(colors.background.r,    colors.background.g,    colors.background.b);
+    let text   = Color32::from_rgb(colors.primary_text.r,  colors.primary_text.g,  colors.primary_text.b);
+    let subtle = Color32::from_rgb(colors.secondary_text.r, colors.secondary_text.g, colors.secondary_text.b);
+    let accent = Color32::from_rgb(colors.accent.r,         colors.accent.g,         colors.accent.b);
+
+    let lum = (colors.background.r as u32 + colors.background.g as u32 + colors.background.b as u32) / 3;
+    let mut v = if lum > 127 { egui::Visuals::light() } else { egui::Visuals::dark() };
+
+    v.panel_fill        = bg;
+    v.window_fill       = bg;
+    v.extreme_bg_color  = blend_color(bg, text, 0.05);
+    v.faint_bg_color    = blend_color(bg, text, 0.03);
+    v.code_bg_color     = blend_color(bg, text, 0.07);
+    v.override_text_color = Some(text);
+    v.hyperlink_color   = accent;
+
+    v.selection.bg_fill = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 90);
+    v.selection.stroke  = Stroke::new(1.0, accent);
+
+    let w_bg        = blend_color(bg, text, 0.08);
+    let w_bg_hover  = blend_color(bg, text, 0.15);
+    let w_bg_active = blend_color(bg, text, 0.22);
+    let border      = blend_color(bg, text, 0.25);
+    let border_acc  = blend_color(border, accent, 0.3);
+
+    v.widgets.noninteractive.bg_fill      = bg;
+    v.widgets.noninteractive.weak_bg_fill = blend_color(bg, text, 0.04);
+    v.widgets.noninteractive.bg_stroke    = Stroke::new(1.0, border);
+    v.widgets.noninteractive.fg_stroke    = Stroke::new(1.0, subtle);
+
+    v.widgets.inactive.bg_fill      = w_bg;
+    v.widgets.inactive.weak_bg_fill = w_bg;
+    v.widgets.inactive.bg_stroke    = Stroke::new(0.5, border);
+    v.widgets.inactive.fg_stroke    = Stroke::new(1.0, text);
+
+    v.widgets.hovered.bg_fill      = w_bg_hover;
+    v.widgets.hovered.weak_bg_fill = w_bg_hover;
+    v.widgets.hovered.bg_stroke    = Stroke::new(1.0, border_acc);
+    v.widgets.hovered.fg_stroke    = Stroke::new(1.5, text);
+
+    v.widgets.active.bg_fill      = w_bg_active;
+    v.widgets.active.weak_bg_fill = w_bg_active;
+    v.widgets.active.bg_stroke    = Stroke::new(1.0, accent);
+    v.widgets.active.fg_stroke    = Stroke::new(2.0, text);
+
+    v.widgets.open.bg_fill      = w_bg_hover;
+    v.widgets.open.weak_bg_fill = w_bg_hover;
+    v.widgets.open.bg_stroke    = Stroke::new(1.0, border);
+    v.widgets.open.fg_stroke    = Stroke::new(1.5, text);
+
+    ctx.set_visuals(v);
 }

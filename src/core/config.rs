@@ -32,6 +32,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub theme: Theme,
     #[serde(default)]
+    pub custom_theme: Option<String>,
+    #[serde(default)]
     pub terminal: TerminalApp,
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
@@ -51,6 +53,7 @@ impl Default for AppConfig {
             show_hidden: false,
             last_path: None,
             theme: Theme::System,
+            custom_theme: None,
             terminal: TerminalApp::Auto,
             sidebar_width: default_sidebar_width(),
             git_panel_height: default_git_panel_height(),

@@ -5,3 +5,4 @@ pub mod tags;
 pub mod global_tags;
 pub mod search;
 pub mod terminal;
+pub mod themes;
