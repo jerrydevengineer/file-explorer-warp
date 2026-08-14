@@ -9,6 +9,7 @@ A native macOS file manager built with Rust and [egui](https://github.com/emilk/
 ### File Browser
 - **Dual-pane split view** — open a second pane side-by-side; drag to resize the divider
 - **Multi-tab navigation** — open multiple directories in tabs per pane; drag tabs across panes to reorganize
+- **Multi-selection** — use `⌘Click`, `⇧Click`, `⌘⇧Click`, or `⌘A`; extend the selection with `⇧↑` / `⇧↓`
 - **Back/forward history** per tab
 - **Sort by** name, size, kind, or date modified (click column headers)
 - **Show/hide hidden files** (dotfiles)
@@ -16,9 +17,11 @@ A native macOS file manager built with Rust and [egui](https://github.com/emilk/
 
 ### File Operations
 - Create files and folders inline (with name editing)
-- Copy, Cut, Paste (`⌘C` / `⌘X` / `⌘V`)
-- Move to Trash (`⌘Backspace`)
-- Drag-and-drop move between panes
+- Copy, Cut, Paste, and Move to Trash operate on all selected items
+- Native Finder clipboard interoperability — copy files between Finder and the app with `⌘C` / `⌘X` / `⌘V`
+- Safe paste handling rejects name collisions instead of silently overwriting files
+- Drag-and-drop move between directories, panes, and sidebar bookmarks
+- Drag files repeatedly to Finder, Google Drive, Obsidian, and other external destinations as Copy
 - Reveal in Finder, Open in Terminal, Get Info, Share sheet
 - Copy file path to clipboard
 
@@ -45,6 +48,8 @@ A native macOS file manager built with Rust and [egui](https://github.com/emilk/
 ### Integrated Terminal (`⌘J`)
 - Embedded `zsh` shell rendered inside the app window
 - Full ANSI/VT100 color support (256-color + true color)
+- Mouse text selection with `⌘C` copy and `⌘V` paste
+- File-browser shortcuts are suppressed while the terminal grid has focus
 - **Bidirectional CWD sync**: navigate in the browser → `cd` fires in the terminal; `cd` in the terminal → browser follows
 - Multiple terminal tabs
 - Resizable panel height
@@ -79,10 +84,13 @@ A native macOS file manager built with Rust and [egui](https://github.com/emilk/
 | Toggle terminal | `⌘J` |
 | Preferences | `⌘,` |
 | Quick Look | `Space` |
-| Copy file | `⌘C` |
-| Cut file | `⌘X` |
-| Paste file | `⌘V` |
-| Move to Trash | `⌘Backspace` |
+| Select all visible files | `⌘A` |
+| Move selection | `↑` / `↓` |
+| Extend selection | `⇧↑` / `⇧↓` |
+| Copy selected files | `⌘C` |
+| Cut selected files | `⌘X` |
+| Paste files | `⌘V` |
+| Move selected files to Trash | `⌘Backspace` |
 
 ---
 
@@ -122,6 +130,7 @@ The output will be at `target/release/bundle/osx/FileExplorer.app`.
 
 Settings are saved automatically to `~/.config/file-explorer/config.json`.  
 Bookmarks are stored at `~/.config/file-explorer/bookmarks.json`.
+Global tags are stored at `~/.config/file-explorer/tags.json`.
 
 ---
 

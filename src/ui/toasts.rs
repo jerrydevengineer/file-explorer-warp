@@ -1,8 +1,11 @@
 use egui::{Color32, CornerRadius, Pos2, Rect, Vec2};
 use std::time::{Duration, Instant};
 
-const TOAST_WIDTH: f32 = 320.0;
-const TOAST_HEIGHT: f32 = 40.0;
+const TOAST_MIN_WIDTH: f32 = 320.0;
+const TOAST_MAX_WIDTH: f32 = 560.0;
+const TOAST_MIN_HEIGHT: f32 = 40.0;
+const TOAST_HORIZONTAL_PADDING: f32 = 18.0;
+const TOAST_VERTICAL_PADDING: f32 = 11.0;
 const TOAST_MARGIN: f32 = 12.0;
 const TOAST_DURATION: Duration = Duration::from_secs(3);
 const FADE_DURATION: Duration = Duration::from_millis(300);
@@ -72,28 +75,35 @@ impl Toasts {
 
         let font_id = egui::FontId::proportional(13.0);
 
-        for (i, toast) in self.items.iter().enumerate() {
-            let alpha = toast.alpha();
-            let bottom_offset = TOAST_MARGIN + (TOAST_HEIGHT + TOAST_MARGIN) * i as f32;
-            let rect = Rect::from_min_size(
-                Pos2::new(
-                    screen.center().x - TOAST_WIDTH / 2.0,
-                    screen.max.y - bottom_offset - TOAST_HEIGHT,
-                ),
-                Vec2::new(TOAST_WIDTH, TOAST_HEIGHT),
-            );
+        let max_width = TOAST_MAX_WIDTH.min((screen.width() - TOAST_MARGIN * 2.0).max(160.0));
+        let text_wrap_width = (max_width - TOAST_HORIZONTAL_PADDING * 2.0).max(120.0);
+        let mut bottom_offset = TOAST_MARGIN;
 
+        for toast in &self.items {
+            let alpha = toast.alpha();
             let bg = Color32::from_rgba_unmultiplied(40, 40, 40, (220.0 * alpha) as u8);
             let fg = Color32::from_rgba_unmultiplied(255, 255, 255, (255.0 * alpha) as u8);
-
-            painter.rect_filled(rect, CornerRadius::same(8), bg);
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                &toast.message,
+            let galley = painter.layout(
+                toast.message.clone(),
                 font_id.clone(),
                 fg,
+                text_wrap_width,
             );
+            let toast_width = (galley.size().x + TOAST_HORIZONTAL_PADDING * 2.0)
+                .clamp(TOAST_MIN_WIDTH.min(max_width), max_width);
+            let toast_height = (galley.size().y + TOAST_VERTICAL_PADDING * 2.0)
+                .max(TOAST_MIN_HEIGHT);
+            let rect = Rect::from_min_size(
+                Pos2::new(
+                    screen.center().x - toast_width / 2.0,
+                    screen.max.y - bottom_offset - toast_height,
+                ),
+                Vec2::new(toast_width, toast_height),
+            );
+
+            painter.rect_filled(rect, CornerRadius::same(8), bg);
+            painter.galley(rect.center() - galley.size() / 2.0, galley, fg);
+            bottom_offset += toast_height + TOAST_MARGIN;
         }
     }
 }

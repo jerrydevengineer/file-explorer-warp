@@ -9,7 +9,7 @@ pub enum FileListAction {
     AddBookmark(PathBuf),
     RevealInFinder(PathBuf),
     OpenInTerminal(PathBuf),
-    DragStarted(PathBuf),
+    DragStarted(Vec<PathBuf>),
     QuickLook(PathBuf),
     Share(PathBuf),
     SetTags(PathBuf, Vec<crate::core::tags::Tag>),
@@ -18,11 +18,11 @@ pub enum FileListAction {
     CreateItem(CreateKind, String),
     StartRename(PathBuf),
     RenameItem(PathBuf, String), // (old_path, new_name)
-    CopyFile(PathBuf),
-    CutFile(PathBuf),
+    CopyFiles(Vec<PathBuf>),
+    CutFiles(Vec<PathBuf>),
     PasteHere,
-    MoveItem(PathBuf, PathBuf), // from_path, to_dir
-    DeleteFile(PathBuf),
+    MoveItems(Vec<PathBuf>, PathBuf), // from_paths, to_dir
+    DeleteFiles(Vec<PathBuf>),
     NavigateAndSelect(PathBuf, PathBuf), // dir_path, file_path
     ClearTagFilter,
 }
@@ -46,7 +46,8 @@ pub struct RenamingItem {
 }
 
 pub struct FileListState {
-    pub selected: Option<PathBuf>,
+    pub selected: Vec<PathBuf>,
+    pub selection_anchor: Option<PathBuf>,
     pub sort_col: SortColumn,
     pub sort_order: SortOrder,
     pub creating: Option<CreatingItem>,
@@ -56,11 +57,117 @@ pub struct FileListState {
 impl Default for FileListState {
     fn default() -> Self {
         Self {
-            selected: None,
+            selected: Vec::new(),
+            selection_anchor: None,
             sort_col: SortColumn::Name,
             sort_order: SortOrder::Ascending,
             creating: None,
             renaming: None,
+        }
+    }
+}
+
+impl FileListState {
+    pub fn primary_selection(&self) -> Option<&PathBuf> {
+        self.selected.last()
+    }
+
+    pub fn select_only(&mut self, path: PathBuf) {
+        self.selected.clear();
+        self.selected.push(path.clone());
+        self.selection_anchor = Some(path);
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
+        self.selection_anchor = None;
+    }
+
+    pub fn select_all<'a>(&mut self, paths: impl IntoIterator<Item = &'a PathBuf>) {
+        self.selected = paths.into_iter().cloned().collect();
+        self.selection_anchor = self.selected.last().cloned();
+    }
+
+    pub fn move_primary(&mut self, visible_paths: &[PathBuf], delta: isize, extend: bool) {
+        if visible_paths.is_empty() {
+            self.clear_selection();
+            return;
+        }
+        let current = self
+            .primary_selection()
+            .and_then(|path| visible_paths.iter().position(|candidate| candidate == path));
+        let next = match current {
+            Some(index) => index.saturating_add_signed(delta).min(visible_paths.len() - 1),
+            None if delta < 0 => visible_paths.len() - 1,
+            None => 0,
+        };
+        let next_path = visible_paths[next].clone();
+        if extend {
+            let anchor = self
+                .selection_anchor
+                .clone()
+                .or_else(|| current.map(|index| visible_paths[index].clone()))
+                .unwrap_or_else(|| next_path.clone());
+            self.select_range(visible_paths, &anchor, &next_path, false);
+            self.selection_anchor = Some(anchor);
+        } else {
+            self.select_only(next_path);
+        }
+    }
+
+    fn update_from_click(
+        &mut self,
+        visible_paths: &[PathBuf],
+        path: &PathBuf,
+        command: bool,
+        shift: bool,
+    ) {
+        if shift {
+            let anchor = self.selection_anchor.clone().unwrap_or_else(|| path.clone());
+            self.select_range(visible_paths, &anchor, path, command);
+            self.selection_anchor = Some(anchor);
+        } else if command {
+            if let Some(index) = self.selected.iter().position(|selected| selected == path) {
+                self.selected.remove(index);
+            } else {
+                self.selected.push(path.clone());
+            }
+            self.selection_anchor = Some(path.clone());
+        } else {
+            self.select_only(path.clone());
+        }
+    }
+
+    fn select_range(
+        &mut self,
+        visible_paths: &[PathBuf],
+        anchor: &PathBuf,
+        target: &PathBuf,
+        additive: bool,
+    ) {
+        let Some(anchor_index) = visible_paths.iter().position(|path| path == anchor) else {
+            self.select_only(target.clone());
+            return;
+        };
+        let Some(target_index) = visible_paths.iter().position(|path| path == target) else {
+            return;
+        };
+        if !additive {
+            self.selected.clear();
+        }
+        let (start, end) = if anchor_index <= target_index {
+            (anchor_index, target_index)
+        } else {
+            (target_index, anchor_index)
+        };
+        for path in &visible_paths[start..=end] {
+            if !self.selected.contains(path) {
+                self.selected.push(path.clone());
+            }
+        }
+        if let Some(index) = self.selected.iter().position(|path| path == target) {
+            let target = self.selected.remove(index);
+            self.selected.push(target);
         }
     }
 }
@@ -74,9 +181,9 @@ pub fn show(
     current_path: &PathBuf,
     tag_filter: Option<&str>,
     global_tags: &crate::core::global_tags::GlobalTags,
-    cut_path: Option<&PathBuf>,
+    cut_paths: &[PathBuf],
     has_clipboard: bool,
-    dragging_path: Option<&PathBuf>,
+    dragging_paths: Option<&Vec<PathBuf>>,
     tag_search_results: Option<&[std::path::PathBuf]>,
 ) -> Vec<FileListAction> {
     let mut actions = Vec::new();
@@ -146,7 +253,7 @@ pub fn show(
                     let parent = path.parent()
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    let is_selected = state.selected.as_ref() == Some(path);
+                    let is_selected = state.selected.contains(path);
 
                     let (row_rect, _) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), ROW_HEIGHT),
@@ -169,7 +276,8 @@ pub fn show(
                     }
 
                     if row_response.clicked() {
-                        state.selected = Some(path.clone());
+                        let modifiers = ui.input(|input| input.modifiers);
+                        state.update_from_click(results, path, modifiers.command, modifiers.shift);
                     }
                     if row_response.double_clicked() {
                         if is_dir {
@@ -193,7 +301,7 @@ pub fn show(
                     egui::vec2(ui.available_width(), remaining),
                     egui::Sense::click(),
                 );
-                if bg_resp.clicked() { state.selected = None; }
+                if bg_resp.clicked() { state.clear_selection(); }
             }
         });
 
@@ -267,6 +375,7 @@ pub fn show(
     } else {
         entries.iter().collect()
     };
+    let display_paths: Vec<PathBuf> = display_entries.iter().map(|entry| entry.path.clone()).collect();
 
     egui::ScrollArea::vertical()
         .drag_to_scroll(false) // ScrollArea would steal drag events needed for DnD
@@ -314,8 +423,10 @@ pub fn show(
         // Enter on selected file starts inline rename (only when no edit is already active)
         if state.renaming.is_none() && state.creating.is_none() {
             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                if let Some(sel) = state.selected.clone() {
-                    actions.push(FileListAction::StartRename(sel));
+                if state.selected.len() == 1 {
+                    if let Some(sel) = state.primary_selection().cloned() {
+                        actions.push(FileListAction::StartRename(sel));
+                    }
                 }
             }
         }
@@ -337,11 +448,11 @@ pub fn show(
         }
 
         let pointer_released = ui.input(|i| i.pointer.any_released());
-        let is_file_dragging = dragging_path.is_some();
+        let is_file_dragging = dragging_paths.is_some();
 
         for (i, entry) in display_entries.iter().enumerate() {
-            let is_selected = state.selected.as_ref().map(|p| p == &entry.path).unwrap_or(false);
-            let is_cut = cut_path.map_or(false, |p| p == &entry.path);
+            let is_selected = state.selected.contains(&entry.path);
+            let is_cut = cut_paths.contains(&entry.path);
             let icon = match entry.kind {
                 FileKind::Directory => "📁",
                 FileKind::Symlink => "🔗",
@@ -362,7 +473,7 @@ pub fn show(
             let is_dir_drop_target = is_file_dragging
                 && entry.kind == FileKind::Directory
                 && row_response.hovered()
-                && dragging_path.map_or(true, |p| p != &entry.path);
+                && dragging_paths.map_or(true, |paths| !paths.contains(&entry.path));
 
             let is_renaming = state.renaming.as_ref().map_or(false, |r| r.path == entry.path);
             // Carries (confirmed, cancelled, new_name) out of the visibility block.
@@ -457,18 +568,27 @@ pub fn show(
 
             if !is_renaming {
                 if row_response.drag_started() {
-                    actions.push(FileListAction::DragStarted(entry.path.clone()));
+                    if !state.selected.contains(&entry.path) {
+                        state.select_only(entry.path.clone());
+                    }
+                    actions.push(FileListAction::DragStarted(state.selected.clone()));
                 }
 
                 // Drop dragged file onto a directory in the same pane
                 if is_dir_drop_target && pointer_released {
-                    if let Some(from) = dragging_path {
-                        actions.push(FileListAction::MoveItem(from.clone(), entry.path.clone()));
+                    if let Some(from) = dragging_paths {
+                        actions.push(FileListAction::MoveItems(from.clone(), entry.path.clone()));
                     }
                 }
 
                 if row_response.clicked() {
-                    state.selected = Some(entry.path.clone());
+                    let modifiers = ui.input(|input| input.modifiers);
+                    state.update_from_click(
+                        &display_paths,
+                        &entry.path,
+                        modifiers.command,
+                        modifiers.shift,
+                    );
                     // Surrender keyboard focus so file-row clicks don't block Cmd+C/X/V shortcuts.
                     ui.memory_mut(|m| m.surrender_focus(row_id));
                 }
@@ -482,6 +602,11 @@ pub fn show(
                 }
 
                 row_response.context_menu(|ui| {
+                    let action_paths = if state.selected.contains(&entry.path) {
+                        state.selected.clone()
+                    } else {
+                        vec![entry.path.clone()]
+                    };
                     if ui.button("Quick Look").on_hover_text("Preview (Space)").clicked() {
                         actions.push(FileListAction::QuickLook(entry.path.clone()));
                         ui.close_menu();
@@ -497,11 +622,11 @@ pub fn show(
                     }
                     ui.separator();
                     if ui.button("Copy  ⌘C").clicked() {
-                        actions.push(FileListAction::CopyFile(entry.path.clone()));
+                        actions.push(FileListAction::CopyFiles(action_paths.clone()));
                         ui.close_menu();
                     }
                     if ui.button("Cut   ⌘X").clicked() {
-                        actions.push(FileListAction::CutFile(entry.path.clone()));
+                        actions.push(FileListAction::CutFiles(action_paths.clone()));
                         ui.close_menu();
                     }
                     if has_clipboard && ui.button("Paste ⌘V").clicked() {
@@ -579,7 +704,7 @@ pub fn show(
                     }
                     ui.separator();
                     if ui.button("Move to Trash  ⌘Delete").clicked() {
-                        actions.push(FileListAction::DeleteFile(entry.path.clone()));
+                        actions.push(FileListAction::DeleteFiles(action_paths));
                         ui.close_menu();
                     }
                     ui.separator();
@@ -606,7 +731,7 @@ pub fn show(
                 egui::Sense::click(),
             );
             if bg_resp.clicked() {
-                state.selected = None;
+                state.clear_selection();
             }
             bg_resp.context_menu(|ui| {
                 if has_clipboard {
@@ -676,5 +801,62 @@ fn file_icon(name: &str) -> &'static str {
         "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" => "🗜",
         "md" | "txt" | "log" => "📝",
         _ => "📄",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FileListState;
+    use std::path::PathBuf;
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn command_click_toggles_without_clearing_other_rows() {
+        let visible = paths(&["a", "b", "c"]);
+        let mut state = FileListState::default();
+        state.update_from_click(&visible, &visible[0], false, false);
+        state.update_from_click(&visible, &visible[2], true, false);
+        assert_eq!(state.selected, paths(&["a", "c"]));
+
+        state.update_from_click(&visible, &visible[0], true, false);
+        assert_eq!(state.selected, paths(&["c"]));
+    }
+
+    #[test]
+    fn shift_click_selects_inclusive_range_and_tracks_primary() {
+        let visible = paths(&["a", "b", "c", "d"]);
+        let mut state = FileListState::default();
+        state.update_from_click(&visible, &visible[1], false, false);
+        state.update_from_click(&visible, &visible[3], false, true);
+
+        assert_eq!(state.selected, paths(&["b", "c", "d"]));
+        assert_eq!(state.primary_selection(), Some(&visible[3]));
+        assert_eq!(state.selection_anchor, Some(visible[1].clone()));
+    }
+
+    #[test]
+    fn command_shift_click_adds_range() {
+        let visible = paths(&["a", "b", "c", "d"]);
+        let mut state = FileListState::default();
+        state.update_from_click(&visible, &visible[0], false, false);
+        state.update_from_click(&visible, &visible[2], true, false);
+        state.update_from_click(&visible, &visible[3], true, true);
+
+        assert_eq!(state.selected, paths(&["a", "c", "d"]));
+    }
+
+    #[test]
+    fn shift_arrow_extends_from_original_anchor() {
+        let visible = paths(&["a", "b", "c", "d"]);
+        let mut state = FileListState::default();
+        state.select_only(visible[1].clone());
+        state.move_primary(&visible, 1, true);
+        state.move_primary(&visible, 1, true);
+
+        assert_eq!(state.selected, paths(&["b", "c", "d"]));
+        assert_eq!(state.selection_anchor, Some(visible[1].clone()));
     }
 }

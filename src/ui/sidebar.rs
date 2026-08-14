@@ -7,7 +7,7 @@ pub enum SidebarAction {
     Navigate(PathBuf),
     OpenFile(PathBuf),
     AddBookmark(PathBuf),
-    MoveFileTo(PathBuf, PathBuf), // from_path, to_dir (drop onto a directory bookmark)
+    MoveFilesTo(Vec<PathBuf>, PathBuf), // from_paths, to_dir (drop onto a directory bookmark)
     FilterTag(Option<String>),
     CreateTag(String, u8),
     DeleteTag(usize),
@@ -37,7 +37,7 @@ pub fn show(
     bookmarks: &mut Bookmarks,
     global_tags: &GlobalTags,
     current_path: &PathBuf,
-    dragging_path: &Option<PathBuf>,
+    dragging_paths: &Option<Vec<PathBuf>>,
     active_tag: Option<&str>,
     new_tag_input: &mut String,
     new_tag_color: &mut u8,
@@ -46,7 +46,7 @@ pub fn show(
     edit_tag_color: &mut u8,
 ) -> Vec<SidebarAction> {
     let mut actions = Vec::new();
-    let is_dragging = dragging_path.is_some();
+    let is_dragging = dragging_paths.is_some();
 
     ui.add_space(4.0);
     ui.label(egui::RichText::new("FAVORITES").small().weak());
@@ -88,8 +88,8 @@ pub fn show(
                 egui::StrokeKind::Inside,
             );
             if pointer_released {
-                if let Some(from) = dragging_path {
-                    actions.push(SidebarAction::MoveFileTo(from.clone(), bookmark.path.clone()));
+                if let Some(from) = dragging_paths {
+                    actions.push(SidebarAction::MoveFilesTo(from.clone(), bookmark.path.clone()));
                     bookmark_drop_handled = true;
                 }
             }
@@ -125,8 +125,10 @@ pub fn show(
     }
     // Section-wide drop: add as bookmark (only if no specific bookmark row caught it)
     if is_dragging && !bookmark_drop_handled && pointer_released && pointer_pos.map_or(false, |p| section_rect.contains(p)) {
-        if let Some(path) = dragging_path {
-            actions.push(SidebarAction::AddBookmark(path.clone()));
+        if let Some(paths) = dragging_paths {
+            if let Some(path) = paths.last() {
+                actions.push(SidebarAction::AddBookmark(path.clone()));
+            }
         }
     }
 
