@@ -1,8 +1,9 @@
-pub mod fs;
 pub mod bookmarks;
 pub mod config;
-pub mod tags;
+pub mod display_text;
+pub mod fs;
 pub mod global_tags;
 pub mod search;
+pub mod tags;
 pub mod terminal;
 pub mod themes;

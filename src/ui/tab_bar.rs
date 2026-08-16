@@ -1,3 +1,4 @@
+use crate::ui::text;
 use eframe::egui;
 
 const TAB_HEIGHT: f32 = 28.0;
@@ -46,12 +47,12 @@ pub fn show(
                 .clamp(TAB_MIN_W, TAB_MAX_W);
 
             // Allocate the tab rect
-            let (tab_rect, _) = ui.allocate_exact_size(
-                egui::vec2(tab_w, TAB_HEIGHT),
-                egui::Sense::hover(),
-            );
+            let (tab_rect, _) =
+                ui.allocate_exact_size(egui::vec2(tab_w, TAB_HEIGHT), egui::Sense::hover());
             let tab_id = ui.id().with(("tab", i));
-            let tab_resp = ui.interact(tab_rect, tab_id, egui::Sense::click_and_drag());
+            let tab_resp = ui
+                .interact(tab_rect, tab_id, egui::Sense::click_and_drag())
+                .on_hover_text(name);
 
             // Background
             let fill = if is_active {
@@ -61,7 +62,8 @@ pub fn show(
             } else {
                 inactive_fill
             };
-            ui.painter().rect_filled(tab_rect, egui::CornerRadius::same(4), fill);
+            ui.painter()
+                .rect_filled(tab_rect, egui::CornerRadius::same(4), fill);
 
             // Active tab bottom border (highlight)
             if is_active {
@@ -77,16 +79,18 @@ pub fn show(
 
             // Tab label text
             let text_x = tab_rect.left() + 8.0;
-            let text_right = if show_close { tab_rect.right() - CLOSE_W - 2.0 } else { tab_rect.right() - 8.0 };
+            let text_right = if show_close {
+                tab_rect.right() - CLOSE_W - 2.0
+            } else {
+                tab_rect.right() - 8.0
+            };
             let text_rect = egui::Rect::from_min_max(
                 egui::pos2(text_x, tab_rect.top()),
                 egui::pos2(text_right, tab_rect.bottom()),
             );
-            // Clip tab label to available space
-            let painter = ui.painter().with_clip_rect(text_rect);
-            painter.text(
-                egui::pos2(text_x, tab_rect.center().y),
-                egui::Align2::LEFT_CENTER,
+            text::paint_truncated(
+                ui,
+                text_rect,
                 name,
                 body_font.clone(),
                 if is_active { text_color } else { weak_color },
@@ -94,8 +98,10 @@ pub fn show(
 
             // Close button
             if show_close {
-                let close_center = egui::pos2(tab_rect.right() - CLOSE_W * 0.5, tab_rect.center().y);
-                let close_rect = egui::Rect::from_center_size(close_center, egui::vec2(CLOSE_W, CLOSE_W));
+                let close_center =
+                    egui::pos2(tab_rect.right() - CLOSE_W * 0.5, tab_rect.center().y);
+                let close_rect =
+                    egui::Rect::from_center_size(close_center, egui::vec2(CLOSE_W, CLOSE_W));
                 let close_id = ui.id().with(("tab_close", i));
                 let close_resp = ui.interact(close_rect, close_id, egui::Sense::click());
                 if close_resp.hovered() {
@@ -132,7 +138,10 @@ pub fn show(
 
     // Drop-target outline drawn over the bar
     if dragging_tab {
-        let full_bar = egui::Rect::from_min_max(bar_rect.min, egui::pos2(bar_rect.max.x, bar_rect.min.y + TAB_HEIGHT));
+        let full_bar = egui::Rect::from_min_max(
+            bar_rect.min,
+            egui::pos2(bar_rect.max.x, bar_rect.min.y + TAB_HEIGHT),
+        );
         ui.painter().rect_stroke(
             full_bar,
             egui::CornerRadius::same(4),

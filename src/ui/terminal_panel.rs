@@ -1,5 +1,7 @@
 use std::time::Duration;
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Vec2};
+use unicode_width::UnicodeWidthStr;
+use crate::core::display_text;
 use crate::core::terminal::{TerminalState, TermColor, TerminalCell, TerminalGrid};
 
 pub enum TerminalPanelEvent {
@@ -20,6 +22,12 @@ const SELECTION_BG: Color32 = Color32::from_rgb(48, 96, 160);
 struct TermSelection {
     start: Option<(usize, usize)>,   // (display_row, col)
     end:   Option<(usize, usize)>,
+}
+
+#[derive(Clone, Default)]
+struct TerminalImeState {
+    enabled: bool,
+    preedit: String,
 }
 
 impl TermSelection {
@@ -117,7 +125,10 @@ pub fn show(
     }
 
     let mut event: Option<TerminalPanelEvent> = None;
-    let font_id = FontId::monospace(FONT_SIZE);
+    let font_id = FontId::new(
+        FONT_SIZE,
+        crate::platform::fonts::terminal_font_family(),
+    );
 
     // Measure a monospace cell once per frame
     let (char_w, char_h) = ui.fonts(|f| {
@@ -132,7 +143,11 @@ pub fn show(
         for (i, term) in terminals.iter().enumerate() {
             let title = {
                 let g = term.grid.lock().unwrap();
-                if g.title.is_empty() { "zsh".to_string() } else { g.title.clone() }
+                if g.title.is_empty() {
+                    "zsh".to_string()
+                } else {
+                    display_text::normalize(&g.title)
+                }
             };
 
             // Tab label — acts as a switch button
@@ -162,7 +177,7 @@ pub fn show(
         // CWD of the active tab — shown after the tab list
         let cwd_str = {
             let g = terminals[active].grid.lock().unwrap();
-            g.cwd.as_ref().and_then(|p| p.to_str()).unwrap_or("").to_string()
+            g.cwd.as_deref().map(display_text::path).unwrap_or_default()
         };
         if !cwd_str.is_empty() {
             ui.separator();
@@ -212,6 +227,37 @@ pub fn show(
     }
     let has_focus = response.has_focus();
 
+    // Custom-painted widgets must explicitly advertise an editable region or
+    // winit leaves native IME disabled. Without this, macOS forwards each
+    // Korean key as a compatibility Jamo through Event::Text instead of
+    // delivering composed text through Event::Ime.
+    let ime_id = egui::Id::new("terminal_ime").with(active);
+    let mut ime: TerminalImeState = ui.data(|d| d.get_temp(ime_id).unwrap_or_default());
+    if has_focus {
+        let cursor_rect = {
+            let grid = terminals[active].grid.lock().unwrap();
+            terminal_cursor_rect(&grid, rect, char_w, char_h)
+        };
+        let to_global = ui
+            .ctx()
+            .layer_transform_to_global(ui.layer_id())
+            .unwrap_or_default();
+        ui.ctx().output_mut(|output| {
+            output.ime = Some(egui::output::IMEOutput {
+                rect: to_global * rect,
+                cursor_rect: to_global * cursor_rect,
+            });
+        });
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::IMEPurpose(
+            egui::viewport::IMEPurpose::Terminal,
+        ));
+    } else if ime.enabled || !ime.preedit.is_empty() {
+        ime = TerminalImeState::default();
+        ui.input_mut(|input| {
+            input.events.retain(|event| !matches!(event, egui::Event::Ime(_)));
+        });
+    }
+
     // ── Cursor blink ──────────────────────────────────────────────────────────
     let time = ui.ctx().input(|i| i.time);
     let cursor_blink_on = !has_focus || ((time * 1000.0 / 600.0).floor() as u64 % 2 == 0);
@@ -259,36 +305,7 @@ pub fn show(
             );
         });
 
-        let mut to_send: Vec<u8> = Vec::new();
-
-        ui.input_mut(|input| {
-            input.events.retain(|event| {
-                match event {
-                    egui::Event::Text(text) => {
-                        to_send.extend_from_slice(text.as_bytes());
-                        false
-                    }
-                    egui::Event::Paste(text) => {
-                        to_send.extend_from_slice(text.as_bytes());
-                        false
-                    }
-                    egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                        if modifiers.ctrl && !modifiers.command && !modifiers.alt {
-                            if let Some(code) = ctrl_seq(*key) {
-                                to_send.push(code);
-                                return false;
-                            }
-                        }
-                        if let Some(seq) = special_seq(*key) {
-                            to_send.extend_from_slice(&seq);
-                            return false;
-                        }
-                        true
-                    }
-                    _ => true,
-                }
-            });
-        });
+        let to_send = ui.input_mut(|input| collect_terminal_input(&mut input.events, &mut ime));
 
         if !to_send.is_empty() {
             sel = TermSelection::default();
@@ -312,6 +329,7 @@ pub fn show(
 
     // Persist selection before potential early return
     ui.data_mut(|d| d.insert_temp(sel_id, sel.clone()));
+    ui.data_mut(|d| d.insert_temp(ime_id, ime.clone()));
 
     // ── Render ────────────────────────────────────────────────────────────────
     if !ui.is_rect_visible(rect) {
@@ -345,7 +363,7 @@ pub fn show(
         let Some(cells) = display_row(&grid, disp_row, offset) else { continue };
         let y = rect.min.y + disp_row as f32 * char_h;
         for col in 0..cols.min(cells.len()) {
-            let bg = if sel.contains(disp_row, col) {
+            let bg = if selection_contains_glyph(&sel, cells, disp_row, col) {
                 SELECTION_BG
             } else {
                 resolve_bg(&cells[col].bg)
@@ -369,18 +387,24 @@ pub fn show(
         let y = rect.min.y + disp_row as f32 * char_h;
         for col in 0..cols.min(cells.len()) {
             let cell = &cells[col];
-            if cell.ch == ' ' {
+            if cell.is_continuation() || (cell.ch == ' ' && cell.combining.is_empty()) {
                 continue;
             }
-            let fg = if sel.contains(disp_row, col) {
+            let fg = if selection_contains_glyph(&sel, cells, disp_row, col) {
                 DEFAULT_FG
             } else {
                 resolve_fg(&cell.fg, cell.bold)
             };
-            painter.text(
+            let glyph_width = usize::from(cell.width.max(1));
+            let glyph_rect = Rect::from_min_size(
                 Pos2::new(rect.min.x + col as f32 * char_w, y),
-                egui::Align2::LEFT_TOP,
-                cell.ch.to_string(),
+                Vec2::new(glyph_width as f32 * char_w, char_h),
+            ).intersect(rect);
+            let (glyph_pos, glyph_align) = glyph_paint_anchor(glyph_rect, cell.width);
+            painter.with_clip_rect(glyph_rect).text(
+                glyph_pos,
+                glyph_align,
+                cell.glyph_text(),
                 font_id.clone(),
                 fg,
             );
@@ -388,20 +412,36 @@ pub fn show(
     }
 
     // ── Cursor ────────────────────────────────────────────────────────────────
-    if cursor_blink_on && offset == 0 && grid.cursor_row < rows && grid.cursor_col < cols {
-        let cx = rect.min.x + grid.cursor_col as f32 * char_w;
+    if cursor_blink_on && offset == 0 && grid.cursor_row < rows && cols > 0 {
+        let mut cursor_col = grid.cursor_col.min(cols.saturating_sub(1));
+        if grid.cursor_row < grid.cells.len()
+            && grid.cells[grid.cursor_row]
+                .get(cursor_col)
+                .map_or(false, TerminalCell::is_continuation)
+        {
+            cursor_col = cursor_col.saturating_sub(1);
+        }
+        let cursor_width = grid.cells
+            .get(grid.cursor_row)
+            .and_then(|row| row.get(cursor_col))
+            .map_or(1, |cell| usize::from(cell.width.max(1)));
+        let cx = rect.min.x + cursor_col as f32 * char_w;
         let cy = rect.min.y + grid.cursor_row as f32 * char_h;
-        let cursor_rect = Rect::from_min_size(Pos2::new(cx, cy), Vec2::new(char_w, char_h));
+        let cursor_rect = Rect::from_min_size(
+            Pos2::new(cx, cy),
+            Vec2::new(cursor_width as f32 * char_w, char_h),
+        ).intersect(rect);
 
         if has_focus {
             painter.rect_filled(cursor_rect, 0.0, DEFAULT_FG);
             if grid.cursor_row < grid.cells.len() {
-                if let Some(cell) = grid.cells[grid.cursor_row].get(grid.cursor_col) {
-                    if cell.ch != ' ' {
-                        painter.text(
-                            Pos2::new(cx, cy),
-                            egui::Align2::LEFT_TOP,
-                            cell.ch.to_string(),
+                if let Some(cell) = grid.cells[grid.cursor_row].get(cursor_col) {
+                    if !cell.is_continuation() && (cell.ch != ' ' || !cell.combining.is_empty()) {
+                        let (glyph_pos, glyph_align) = glyph_paint_anchor(cursor_rect, cell.width);
+                        painter.with_clip_rect(cursor_rect).text(
+                            glyph_pos,
+                            glyph_align,
+                            cell.glyph_text(),
                             font_id.clone(),
                             DEFAULT_BG,
                         );
@@ -416,6 +456,29 @@ pub fn show(
                 egui::StrokeKind::Inside,
             );
         }
+    }
+
+    // Preedit belongs to the native IME, not to the PTY. Draw it at the live
+    // cursor until Commit arrives; only the committed UTF-8 text is sent to zsh.
+    if has_focus && offset == 0 && !ime.preedit.is_empty() {
+        let cursor_rect = terminal_cursor_rect(&grid, rect, char_w, char_h);
+        let preedit_cells = UnicodeWidthStr::width(ime.preedit.as_str()).max(1);
+        let preedit_rect = Rect::from_min_size(
+            cursor_rect.min,
+            Vec2::new(preedit_cells as f32 * char_w, char_h),
+        ).intersect(rect);
+        painter.rect_filled(preedit_rect, 0.0, DEFAULT_BG);
+        painter.text(
+            preedit_rect.min,
+            egui::Align2::LEFT_TOP,
+            &ime.preedit,
+            font_id.clone(),
+            DEFAULT_FG,
+        );
+        painter.line_segment(
+            [preedit_rect.left_bottom(), preedit_rect.right_bottom()],
+            egui::Stroke::new(1.0, DEFAULT_FG),
+        );
     }
 
     // ── Scrollback indicator ──────────────────────────────────────────────────
@@ -456,6 +519,142 @@ fn pos_to_cell(
     (row.min(rows.saturating_sub(1)), col.min(cols.saturating_sub(1)))
 }
 
+fn terminal_cursor_rect(
+    grid: &TerminalGrid,
+    rect: Rect,
+    char_w: f32,
+    char_h: f32,
+) -> Rect {
+    let col = grid.cursor_col.min(grid.cols.saturating_sub(1));
+    let row = grid.cursor_row.min(grid.rows.saturating_sub(1));
+    Rect::from_min_size(
+        Pos2::new(
+            rect.min.x + col as f32 * char_w,
+            rect.min.y + row as f32 * char_h,
+        ),
+        Vec2::new(char_w, char_h),
+    ).intersect(rect)
+}
+
+fn collect_terminal_input(
+    events: &mut Vec<egui::Event>,
+    ime: &mut TerminalImeState,
+) -> Vec<u8> {
+    let ime_was_enabled = ime.enabled;
+    let frame_has_composition = events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::Ime(
+                egui::ImeEvent::Enabled
+                    | egui::ImeEvent::Preedit(_)
+                    | egui::ImeEvent::Commit(_)
+            )
+        )
+    });
+    let mut to_send = Vec::new();
+
+    // Process IME events first. macOS can put the final compatibility-Jamo
+    // keyboard event and the composed Commit in the same frame.
+    for event in events.iter() {
+        match event {
+            egui::Event::Ime(egui::ImeEvent::Enabled) => {
+                ime.enabled = true;
+            }
+            egui::Event::Ime(egui::ImeEvent::Preedit(text)) => {
+                ime.enabled = true;
+                ime.preedit.clone_from(text);
+            }
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                if text != "\n" && text != "\r" {
+                    to_send.extend_from_slice(text.as_bytes());
+                }
+                ime.enabled = false;
+                ime.preedit.clear();
+            }
+            egui::Event::Ime(egui::ImeEvent::Disabled) => {
+                ime.enabled = false;
+                ime.preedit.clear();
+            }
+            _ => {}
+        }
+    }
+
+    let suppress_text = ime_was_enabled || ime.enabled || frame_has_composition;
+    events.retain(|event| {
+        match event {
+            egui::Event::Ime(_) => false,
+            egui::Event::Text(text) => {
+                if !suppress_text {
+                    to_send.extend_from_slice(text.as_bytes());
+                }
+                false
+            }
+            egui::Event::Paste(text) => {
+                to_send.extend_from_slice(text.as_bytes());
+                false
+            }
+            egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                if ime_was_enabled && is_ime_navigation_key(*key) {
+                    return false;
+                }
+                if modifiers.ctrl && !modifiers.command && !modifiers.alt {
+                    if let Some(code) = ctrl_seq(*key) {
+                        to_send.push(code);
+                        return false;
+                    }
+                }
+                if let Some(seq) = special_seq(*key) {
+                    to_send.extend_from_slice(&seq);
+                    return false;
+                }
+                true
+            }
+            _ => true,
+        }
+    });
+
+    to_send
+}
+
+fn is_ime_navigation_key(key: egui::Key) -> bool {
+    matches!(
+        key,
+        egui::Key::Backspace
+            | egui::Key::ArrowUp
+            | egui::Key::ArrowDown
+            | egui::Key::ArrowLeft
+            | egui::Key::ArrowRight
+    )
+}
+
+fn glyph_paint_anchor(rect: Rect, width: u8) -> (Pos2, egui::Align2) {
+    if width == 2 {
+        (Pos2::new(rect.center().x, rect.top()), egui::Align2::CENTER_TOP)
+    } else {
+        (rect.min, egui::Align2::LEFT_TOP)
+    }
+}
+
+fn selection_contains_glyph(
+    sel: &TermSelection,
+    cells: &[TerminalCell],
+    row: usize,
+    col: usize,
+) -> bool {
+    if col >= cells.len() {
+        return false;
+    }
+    let lead_col = if cells[col].is_continuation() {
+        col.saturating_sub(1)
+    } else {
+        col
+    };
+    let width = cells
+        .get(lead_col)
+        .map_or(1, |cell| usize::from(cell.width.max(1)));
+    (lead_col..(lead_col + width).min(cells.len())).any(|glyph_col| sel.contains(row, glyph_col))
+}
+
 fn extract_selection_text(
     grid: &TerminalGrid,
     sel: &TermSelection,
@@ -468,14 +667,23 @@ fn extract_selection_text(
     let mut lines: Vec<String> = Vec::new();
     for r in sr..=er {
         let Some(cells) = display_row(grid, r, offset) else { continue };
-        let c_start = if r == sr { sc.min(cells.len()) } else { 0 };
+        let mut c_start = if r == sr { sc.min(cells.len()) } else { 0 };
+        if c_start < cells.len() && cells[c_start].is_continuation() {
+            c_start = c_start.saturating_sub(1);
+        }
         let c_end = if r == er {
             ec.min(cells.len().saturating_sub(1))
         } else {
             cells.len().saturating_sub(1)
         };
         if c_start < cells.len() && c_start <= c_end {
-            let line: String = cells[c_start..=c_end].iter().map(|c| c.ch).collect();
+            let line: String = cells[c_start..=c_end]
+                .iter()
+                .filter(|cell| !cell.is_continuation())
+                .fold(String::new(), |mut text, cell| {
+                    text.push_str(&cell.glyph_text());
+                    text
+                });
             lines.push(line.trim_end().to_string());
         } else {
             lines.push(String::new());
@@ -562,5 +770,124 @@ fn special_seq(key: egui::Key) -> Option<Vec<u8>> {
         egui::Key::F11        => Some(b"\x1b[23~".to_vec()),
         egui::Key::F12        => Some(b"\x1b[24~".to_vec()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        collect_terminal_input, extract_selection_text, selection_contains_glyph,
+        TermSelection, TerminalImeState,
+    };
+    use crate::core::terminal::{TermPerformer, TerminalGrid};
+
+    fn grid_with_output(text: &str) -> TerminalGrid {
+        let mut grid = TerminalGrid::new(12, 2);
+        let mut parser = vte::Parser::new();
+        let mut performer = TermPerformer { grid: &mut grid };
+        for byte in text.as_bytes() {
+            parser.advance(&mut performer, *byte);
+        }
+        grid
+    }
+
+    #[test]
+    fn selection_highlights_both_halves_and_copies_wide_glyph_once() {
+        let grid = grid_with_output("한");
+        let selection = TermSelection {
+            start: Some((0, 0)),
+            end: Some((0, 1)),
+        };
+
+        assert!(selection_contains_glyph(
+            &selection,
+            &grid.cells[0],
+            0,
+            0,
+        ));
+        assert!(selection_contains_glyph(
+            &selection,
+            &grid.cells[0],
+            0,
+            1,
+        ));
+        assert_eq!(extract_selection_text(&grid, &selection, 2, 0), "한");
+    }
+
+    #[test]
+    fn ime_sends_only_committed_hangul_to_the_pty() {
+        let mut ime = TerminalImeState::default();
+        let mut composing = vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Text("ㅎ".to_string()),
+            egui::Event::Ime(egui::ImeEvent::Preedit("하".to_string())),
+            egui::Event::Text("ㅏ".to_string()),
+        ];
+
+        let bytes = collect_terminal_input(&mut composing, &mut ime);
+
+        assert!(bytes.is_empty());
+        assert!(composing.is_empty());
+        assert!(ime.enabled);
+        assert_eq!(ime.preedit, "하");
+
+        // The raw final key can precede Commit in the same macOS frame. It
+        // must not be forwarded in addition to the composed syllable.
+        let mut committed = vec![
+            egui::Event::Text("ㄴ".to_string()),
+            egui::Event::Ime(egui::ImeEvent::Commit("한".to_string())),
+            egui::Event::Ime(egui::ImeEvent::Disabled),
+        ];
+
+        let bytes = collect_terminal_input(&mut committed, &mut ime);
+
+        assert_eq!(bytes, "한".as_bytes());
+        assert!(committed.is_empty());
+        assert!(!ime.enabled);
+        assert!(ime.preedit.is_empty());
+    }
+
+    #[test]
+    fn ordinary_text_still_reaches_the_pty_outside_ime() {
+        let mut ime = TerminalImeState::default();
+        let mut events = vec![egui::Event::Text("cargo run".to_string())];
+
+        let bytes = collect_terminal_input(&mut events, &mut ime);
+
+        assert_eq!(bytes, b"cargo run");
+        assert!(events.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn terminal_korean_fallback_has_wide_glyph_metrics() {
+        let context = egui::Context::default();
+        crate::platform::fonts::setup_fonts(&context);
+        let mut metrics = (0.0, 0.0, 0.0);
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                let font = egui::FontId::new(
+                    super::FONT_SIZE,
+                    crate::platform::fonts::terminal_font_family(),
+                );
+                metrics = ui.fonts(|fonts| {
+                    let cell = fonts.glyph_width(&font, 'M');
+                    let korean = fonts
+                        .layout_no_wrap("한".to_string(), font.clone(), egui::Color32::WHITE)
+                        .size()
+                        .x;
+                    let word = fonts
+                        .layout_no_wrap("한글".to_string(), font, egui::Color32::WHITE)
+                        .size()
+                        .x;
+                    (cell, korean, word)
+                });
+            });
+        });
+
+        assert!(metrics.1 >= metrics.0 * 1.6);
+        assert!(metrics.1 <= metrics.0 * 2.0 + 0.5);
+        assert!(metrics.2 >= metrics.0 * 3.2);
+        assert!(metrics.2 <= metrics.0 * 4.0 + 0.5);
     }
 }

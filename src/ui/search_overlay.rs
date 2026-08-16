@@ -1,5 +1,7 @@
-use std::path::{Path, PathBuf};
+use crate::core::display_text;
+use crate::ui::text;
 use eframe::egui;
+use std::path::{Path, PathBuf};
 
 pub enum SearchAction {
     /// Navigate to this path (go to parent dir and select the entry).
@@ -85,12 +87,7 @@ pub fn show(
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new("No results")
-                                .weak()
-                                .italics()
-                                .small(),
-                        );
+                        ui.label(egui::RichText::new("No results").weak().italics().small());
                     });
                     ui.add_space(6.0);
                 }
@@ -109,18 +106,18 @@ pub fn show(
                     for (i, path) in results.iter().enumerate() {
                         let is_sel = *selected == i;
 
-                        let name = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                        let name = if path.file_name().is_some() {
+                            display_text::file_name(path)
+                        } else {
+                            display_text::path(path)
+                        };
                         let rel = relative_display(root, path);
                         let icon = if path.is_dir() { "📁" } else { "📄" };
 
                         let avail_w = ui.available_width();
-                        let (rect, resp) = ui.allocate_exact_size(
-                            egui::vec2(avail_w, row_h),
-                            egui::Sense::click(),
-                        );
+                        let (rect, response) = ui
+                            .allocate_exact_size(egui::vec2(avail_w, row_h), egui::Sense::click());
+                        let resp = response.on_hover_text(display_text::path(path));
 
                         if resp.hovered() {
                             *selected = i;
@@ -128,11 +125,8 @@ pub fn show(
 
                         // Row background
                         if is_sel {
-                            ui.painter().rect_filled(
-                                rect,
-                                4.0,
-                                ui.visuals().selection.bg_fill,
-                            );
+                            ui.painter()
+                                .rect_filled(rect, 4.0, ui.visuals().selection.bg_fill);
                         } else if resp.hovered() {
                             ui.painter().rect_filled(
                                 rect,
@@ -147,20 +141,25 @@ pub fn show(
                             ui.visuals().text_color()
                         };
 
-                        // Primary: icon + file name
-                        ui.painter().text(
-                            egui::pos2(rect.left() + 10.0, rect.top() + 8.0),
-                            egui::Align2::LEFT_TOP,
-                            format!("{} {}", icon, name),
+                        // Primary and secondary lines are independently bounded.
+                        text::paint_truncated(
+                            ui,
+                            egui::Rect::from_min_max(
+                                egui::pos2(rect.left() + 10.0, rect.top() + 3.0),
+                                egui::pos2(rect.right() - 10.0, rect.top() + 23.0),
+                            ),
+                            &format!("{} {}", icon, name),
                             egui::FontId::proportional(13.0),
                             text_col,
                         );
 
-                        // Secondary: relative path (dimmer, smaller)
-                        ui.painter().text(
-                            egui::pos2(rect.left() + 10.0, rect.top() + 26.0),
-                            egui::Align2::LEFT_TOP,
-                            rel,
+                        text::paint_truncated(
+                            ui,
+                            egui::Rect::from_min_max(
+                                egui::pos2(rect.left() + 10.0, rect.top() + 23.0),
+                                egui::pos2(rect.right() - 10.0, rect.bottom() - 2.0),
+                            ),
+                            &rel,
                             egui::FontId::proportional(11.0),
                             ui.visuals().weak_text_color(),
                         );
@@ -189,8 +188,12 @@ pub fn show(
 fn relative_display(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .map(|p| {
-            let s = p.to_string_lossy();
-            if s.is_empty() { ".".to_string() } else { s.into_owned() }
+            let display = display_text::path(p);
+            if display.is_empty() {
+                ".".to_string()
+            } else {
+                display
+            }
         })
-        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| display_text::path(path))
 }

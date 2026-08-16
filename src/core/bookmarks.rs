@@ -1,5 +1,7 @@
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+use crate::core::display_text;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bookmark {
@@ -41,10 +43,11 @@ impl Bookmarks {
         if self.items.iter().any(|b| b.path == path) {
             return;
         }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.to_string_lossy().to_string());
+        let name = if path.file_name().is_some() {
+            display_text::file_name(&path)
+        } else {
+            display_text::path(&path)
+        };
         self.items.push(Bookmark { name, path });
         self.save();
     }

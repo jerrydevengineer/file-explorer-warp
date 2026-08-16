@@ -1,7 +1,9 @@
+use nucleo::pattern::{CaseMatching, Normalization};
+use nucleo::{Config, Nucleo};
 use std::path::PathBuf;
 use std::sync::Arc;
-use nucleo::{Config, Nucleo};
-use nucleo::pattern::{CaseMatching, Normalization};
+
+use crate::core::display_text;
 
 pub struct SearchEngine {
     nucleo: Nucleo<PathBuf>,
@@ -26,14 +28,16 @@ impl SearchEngine {
                 .filter_map(|e| e.ok())
             {
                 // Skip the root itself
-                if entry.depth() == 0 { continue; }
+                if entry.depth() == 0 {
+                    continue;
+                }
 
                 let path = entry.path().to_path_buf();
                 // Match column: path relative to root (e.g. "src/core/fs.rs")
                 let display = path
                     .strip_prefix(&root_clone)
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+                    .map(display_text::path)
+                    .unwrap_or_else(|_| display_text::path(&path));
 
                 let _ = injector.push(path, move |_, cols| {
                     cols[0] = display.into();
@@ -41,16 +45,23 @@ impl SearchEngine {
             }
         });
 
-        Self { nucleo, root, last_query: String::new() }
+        Self {
+            nucleo,
+            root,
+            last_query: String::new(),
+        }
     }
 
     /// Update the fuzzy pattern when the user's query changes.
     pub fn set_query(&mut self, query: &str) {
-        if self.last_query == query { return; }
-        self.last_query = query.to_string();
+        let normalized_query = display_text::normalize(query);
+        if self.last_query == normalized_query {
+            return;
+        }
+        self.last_query = normalized_query.clone();
         self.nucleo.pattern.reparse(
             0,
-            query,
+            &normalized_query,
             CaseMatching::Smart,
             Normalization::Never,
             false,

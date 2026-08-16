@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use portable_pty::{CommandBuilder, PtySize};
+use unicode_normalization::char::compose;
+use unicode_width::UnicodeWidthChar;
 
 // ── Color ─────────────────────────────────────────────────────────────────────
 
@@ -20,6 +22,11 @@ pub enum TermColor {
 #[derive(Clone, Debug)]
 pub struct TerminalCell {
     pub ch: char,
+    /// Extra zero-width scalars that could not be canonically composed with
+    /// `ch`, rendered as part of the same terminal glyph.
+    pub combining: String,
+    /// Display width: 0 = continuation, 1 = normal, 2 = wide leading cell.
+    pub width: u8,
     pub fg: TermColor,
     pub bg: TermColor,
     pub bold: bool,
@@ -31,12 +38,26 @@ impl Default for TerminalCell {
     fn default() -> Self {
         Self {
             ch: ' ',
+            combining: String::new(),
+            width: 1,
             fg: TermColor::Default,
             bg: TermColor::Default,
             bold: false,
             italic: false,
             underline: false,
         }
+    }
+}
+
+impl TerminalCell {
+    pub fn is_continuation(&self) -> bool {
+        self.width == 0
+    }
+
+    pub fn glyph_text(&self) -> String {
+        let mut text = self.ch.to_string();
+        text.push_str(&self.combining);
+        text
     }
 }
 
@@ -100,6 +121,15 @@ impl TerminalGrid {
         self.cols = cols;
         self.rows = rows;
         self.cells = new_cells;
+        for row in 0..self.rows {
+            self.repair_row(row);
+        }
+        let blank = self.current_cell();
+        for line in &mut self.scrollback {
+            line.resize(cols, blank.clone());
+            line.truncate(cols);
+            Self::repair_cells(line, &blank);
+        }
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
         self.scroll_top = 0;
@@ -119,6 +149,8 @@ impl TerminalGrid {
     fn current_cell(&self) -> TerminalCell {
         TerminalCell {
             ch: ' ',
+            combining: String::new(),
+            width: 1,
             fg: self.cur_fg.clone(),
             bg: self.cur_bg.clone(),
             bold: self.cur_bold,
@@ -127,21 +159,216 @@ impl TerminalGrid {
         }
     }
 
+    fn continuation_cell(&self) -> TerminalCell {
+        let mut cell = self.current_cell();
+        cell.width = 0;
+        cell
+    }
+
+    fn display_width(c: char) -> usize {
+        UnicodeWidthChar::width(c).unwrap_or(0).min(2)
+    }
+
+    fn previous_lead_position(&self) -> Option<(usize, usize)> {
+        if self.cursor_row >= self.rows || self.cols == 0 || self.cursor_col == 0 {
+            return None;
+        }
+        let mut col = self.cursor_col.min(self.cols).saturating_sub(1);
+        while col > 0 && self.cells[self.cursor_row][col].is_continuation() {
+            col -= 1;
+        }
+        (!self.cells[self.cursor_row][col].is_continuation()).then_some((self.cursor_row, col))
+    }
+
+    /// Compose canonical sequences (including Hangul L/V/T Jamo) into the
+    /// previous leading cell. Other zero-width scalars are retained on that
+    /// cell so they render and copy without consuming a terminal column.
+    fn attach_to_previous(&mut self, c: char) -> bool {
+        let Some((row, col)) = self.previous_lead_position() else {
+            return false;
+        };
+        let previous = &mut self.cells[row][col];
+        if previous.combining.is_empty() {
+            if let Some(composed) = compose(previous.ch, c) {
+                previous.ch = composed;
+                return true;
+            }
+        }
+        if Self::display_width(c) == 0 {
+            previous.combining.push(c);
+            return true;
+        }
+        false
+    }
+
+    fn clear_glyph_at(&mut self, row: usize, col: usize) {
+        if row >= self.rows || col >= self.cols {
+            return;
+        }
+        let lead_col = if self.cells[row][col].is_continuation() {
+            col.saturating_sub(1)
+        } else {
+            col
+        };
+        let old_width = self.cells[row][lead_col].width;
+        let blank = self.current_cell();
+        self.cells[row][lead_col] = blank.clone();
+        if old_width == 2 && lead_col + 1 < self.cols {
+            self.cells[row][lead_col + 1] = blank;
+        }
+    }
+
+    fn repair_cells(cells: &mut [TerminalCell], blank: &TerminalCell) {
+        let mut col = 0;
+        while col < cells.len() {
+            match cells[col].width {
+                2 if col + 1 < cells.len() => {
+                    let mut continuation = cells[col].clone();
+                    continuation.ch = ' ';
+                    continuation.combining.clear();
+                    continuation.width = 0;
+                    cells[col + 1] = continuation;
+                    col += 2;
+                }
+                2 => {
+                    cells[col] = blank.clone();
+                    col += 1;
+                }
+                0 => {
+                    cells[col] = blank.clone();
+                    col += 1;
+                }
+                _ => {
+                    cells[col].width = 1;
+                    col += 1;
+                }
+            }
+        }
+    }
+
+    fn repair_row(&mut self, row: usize) {
+        if row >= self.rows {
+            return;
+        }
+        let blank = self.current_cell();
+        Self::repair_cells(&mut self.cells[row], &blank);
+    }
+
+    fn snap_cursor_from_continuation(&mut self) {
+        if self.cursor_row < self.rows
+            && self.cursor_col < self.cols
+            && self.cells[self.cursor_row][self.cursor_col].is_continuation()
+        {
+            self.cursor_col = self.cursor_col.saturating_sub(1);
+        }
+    }
+
     fn put_char(&mut self, c: char) {
-        if self.cursor_col >= self.cols {
+        if self.attach_to_previous(c) {
+            return;
+        }
+
+        let mut width = Self::display_width(c);
+        if width == 0 {
+            return;
+        }
+        if self.cols == 1 {
+            width = 1;
+        }
+        if self.cursor_col >= self.cols || (width == 2 && self.cursor_col + width > self.cols) {
             self.cursor_col = 0;
             self.advance_row();
         }
-        if self.cursor_row < self.rows {
-            let cell = &mut self.cells[self.cursor_row][self.cursor_col];
-            cell.ch = c;
-            cell.fg = self.cur_fg.clone();
-            cell.bg = self.cur_bg.clone();
-            cell.bold = self.cur_bold;
-            cell.italic = self.cur_italic;
-            cell.underline = self.cur_underline;
+        if self.cursor_row >= self.rows || self.cursor_col >= self.cols {
+            return;
         }
-        self.cursor_col += 1;
+
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        self.clear_glyph_at(row, col);
+        if width == 2 {
+            self.clear_glyph_at(row, col + 1);
+        }
+
+        let mut cell = self.current_cell();
+        cell.ch = c;
+        cell.width = width as u8;
+        self.cells[row][col] = cell;
+        if width == 2 {
+            self.cells[row][col + 1] = self.continuation_cell();
+        }
+        self.cursor_col += width;
+    }
+
+    fn backspace_cursor(&mut self) {
+        if self.cursor_col == 0 {
+            return;
+        }
+        self.cursor_col = self.cursor_col.min(self.cols).saturating_sub(1);
+    }
+
+    fn cursor_forward(&mut self, count: usize) {
+        self.cursor_col = (self.cursor_col + count).min(self.cols.saturating_sub(1));
+    }
+
+    fn cursor_backward(&mut self, count: usize) {
+        self.cursor_col = self.cursor_col.saturating_sub(count);
+    }
+
+    fn set_cursor_col(&mut self, col: usize) {
+        self.cursor_col = col.min(self.cols.saturating_sub(1));
+    }
+
+    fn erase_range(&mut self, row: usize, mut start: usize, mut end: usize) {
+        if row >= self.rows || start >= end || start >= self.cols {
+            return;
+        }
+        start = start.min(self.cols);
+        end = end.min(self.cols);
+        if self.cells[row][start].is_continuation() {
+            start = start.saturating_sub(1);
+        }
+        if end < self.cols && self.cells[row][end].is_continuation() {
+            end += 1;
+        }
+        let blank = self.current_cell();
+        for col in start..end.min(self.cols) {
+            self.cells[row][col] = blank.clone();
+        }
+        self.repair_row(row);
+    }
+
+    fn delete_chars(&mut self, count: usize) {
+        if self.cursor_row >= self.rows || self.cursor_col >= self.cols {
+            return;
+        }
+        self.snap_cursor_from_continuation();
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        let mut end = (col + count).min(self.cols);
+        if end < self.cols && self.cells[row][end].is_continuation() {
+            end += 1;
+        }
+        let remove_count = end.saturating_sub(col);
+        self.cells[row].drain(col..end);
+        let blank = self.current_cell();
+        self.cells[row].extend(std::iter::repeat(blank).take(remove_count));
+        self.repair_row(row);
+    }
+
+    fn insert_chars(&mut self, count: usize) {
+        if self.cursor_row >= self.rows || self.cursor_col >= self.cols {
+            return;
+        }
+        self.snap_cursor_from_continuation();
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        let blank = self.current_cell();
+        for _ in 0..count.min(self.cols) {
+            self.cells[row].insert(col, blank.clone());
+        }
+        self.cells[row].truncate(self.cols);
+        self.repair_row(row);
     }
 
     fn advance_row(&mut self) {
@@ -164,9 +391,7 @@ impl TerminalGrid {
         match mode {
             0 => {
                 // erase from cursor to end
-                for col in self.cursor_col..self.cols {
-                    self.cells[self.cursor_row][col] = blank.clone();
-                }
+                self.erase_range(self.cursor_row, self.cursor_col, self.cols);
                 for row in (self.cursor_row + 1)..self.rows {
                     self.cells[row] = vec![blank.clone(); self.cols];
                 }
@@ -176,9 +401,8 @@ impl TerminalGrid {
                 for row in 0..self.cursor_row {
                     self.cells[row] = vec![blank.clone(); self.cols];
                 }
-                for col in 0..=self.cursor_col.min(self.cols.saturating_sub(1)) {
-                    self.cells[self.cursor_row][col] = blank.clone();
-                }
+                let end = self.cursor_col.min(self.cols.saturating_sub(1)) + 1;
+                self.erase_range(self.cursor_row, 0, end);
             }
             2 | 3 => {
                 // erase entire display
@@ -197,14 +421,11 @@ impl TerminalGrid {
         let blank = self.current_cell();
         match mode {
             0 => {
-                for col in self.cursor_col..self.cols {
-                    self.cells[self.cursor_row][col] = blank.clone();
-                }
+                self.erase_range(self.cursor_row, self.cursor_col, self.cols);
             }
             1 => {
-                for col in 0..=self.cursor_col.min(self.cols.saturating_sub(1)) {
-                    self.cells[self.cursor_row][col] = blank.clone();
-                }
+                let end = self.cursor_col.min(self.cols.saturating_sub(1)) + 1;
+                self.erase_range(self.cursor_row, 0, end);
             }
             2 => {
                 self.cells[self.cursor_row] = vec![blank; self.cols];
@@ -235,15 +456,13 @@ impl vte::Perform for TermPerformer<'_> {
             }
             0x08 => {
                 // backspace
-                if self.grid.cursor_col > 0 {
-                    self.grid.cursor_col -= 1;
-                }
+                self.grid.backspace_cursor();
             }
             0x07 => {} // bell — ignore
             0x09 => {
                 // tab — advance to next 8-column boundary
                 let next = (self.grid.cursor_col / 8 + 1) * 8;
-                self.grid.cursor_col = next.min(self.grid.cols.saturating_sub(1));
+                self.grid.set_cursor_col(next);
             }
             _ => {}
         }
@@ -275,16 +494,16 @@ impl vte::Perform for TermPerformer<'_> {
             'C' | 'a' => {
                 // cursor forward
                 let n = p0.max(1) as usize;
-                g.cursor_col = (g.cursor_col + n).min(g.cols.saturating_sub(1));
+                g.cursor_forward(n);
             }
             'D' => {
                 // cursor back
                 let n = p0.max(1) as usize;
-                g.cursor_col = g.cursor_col.saturating_sub(n);
+                g.cursor_backward(n);
             }
             'G' => {
                 // cursor horizontal absolute
-                g.cursor_col = (p0.max(1) as usize).saturating_sub(1).min(g.cols.saturating_sub(1));
+                g.set_cursor_col((p0.max(1) as usize).saturating_sub(1));
             }
             'd' => {
                 // cursor vertical absolute
@@ -293,7 +512,7 @@ impl vte::Perform for TermPerformer<'_> {
             'H' | 'f' => {
                 // cursor position (1-based)
                 g.cursor_row = (p0.max(1) as usize).saturating_sub(1).min(g.rows.saturating_sub(1));
-                g.cursor_col = (p1.max(1) as usize).saturating_sub(1).min(g.cols.saturating_sub(1));
+                g.set_cursor_col((p1.max(1) as usize).saturating_sub(1));
             }
             'J' => g.erase_in_display(p0),
             'K' => g.erase_in_line(p0),
@@ -323,28 +542,12 @@ impl vte::Perform for TermPerformer<'_> {
             'P' => {
                 // delete characters
                 let n = p0.max(1) as usize;
-                let row = g.cursor_row;
-                let col = g.cursor_col;
-                for _ in 0..n {
-                    if col < g.cells[row].len() {
-                        let filler = g.current_cell();
-                        g.cells[row].remove(col);
-                        g.cells[row].push(filler);
-                    }
-                }
+                g.delete_chars(n);
             }
             '@' => {
                 // insert characters
                 let n = p0.max(1) as usize;
-                let row = g.cursor_row;
-                let col = g.cursor_col;
-                for _ in 0..n {
-                    if g.cells[row].len() >= g.cols {
-                        g.cells[row].pop();
-                    }
-                    let blank = g.current_cell();
-                    g.cells[row].insert(col, blank);
-                }
+                g.insert_chars(n);
             }
             'r' => {
                 // set scrolling region
@@ -552,5 +755,202 @@ impl TerminalState {
 
     pub fn write_input(&mut self, bytes: &[u8]) {
         let _ = self.writer.write_all(bytes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TermPerformer, TerminalGrid};
+
+    fn feed(grid: &mut TerminalGrid, text: &str) {
+        let mut parser = vte::Parser::new();
+        let mut performer = TermPerformer { grid };
+        for byte in text.as_bytes() {
+            parser.advance(&mut performer, *byte);
+        }
+    }
+
+    fn assert_no_orphan_continuations(grid: &TerminalGrid, row: usize) {
+        for col in 0..grid.cols {
+            let cell = &grid.cells[row][col];
+            if cell.width == 0 {
+                assert!(col > 0, "continuation cannot be the first cell");
+                assert_eq!(grid.cells[row][col - 1].width, 2);
+            }
+            if cell.width == 2 {
+                assert!(col + 1 < grid.cols, "wide lead must fit in the row");
+                assert_eq!(grid.cells[row][col + 1].width, 0);
+            }
+        }
+    }
+
+    fn row_text(grid: &TerminalGrid, row: usize) -> String {
+        grid.cells[row]
+            .iter()
+            .filter(|cell| !cell.is_continuation())
+            .fold(String::new(), |mut text, cell| {
+                text.push_str(&cell.glyph_text());
+                text
+            })
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn ascii_advances_one_cell() {
+        let mut grid = TerminalGrid::new(8, 2);
+        grid.put_char('A');
+
+        assert_eq!(grid.cursor_col, 1);
+        assert_eq!(grid.cells[0][0].ch, 'A');
+        assert_eq!(grid.cells[0][0].width, 1);
+    }
+
+    #[test]
+    fn precomposed_hangul_uses_two_cells() {
+        let mut grid = TerminalGrid::new(8, 2);
+        grid.put_char('한');
+
+        assert_eq!(grid.cursor_col, 2);
+        assert_eq!(grid.cells[0][0].ch, '한');
+        assert_eq!(grid.cells[0][0].width, 2);
+        assert_eq!(grid.cells[0][1].width, 0);
+    }
+
+    #[test]
+    fn nfd_hangul_composes_without_extra_columns() {
+        let mut grid = TerminalGrid::new(8, 2);
+        for c in "\u{1112}\u{1161}\u{11ab}".chars() {
+            grid.put_char(c);
+        }
+
+        assert_eq!(grid.cursor_col, 2);
+        assert_eq!(grid.cells[0][0].ch, '한');
+        assert_eq!(grid.cells[0][0].width, 2);
+        assert_eq!(grid.cells[0][1].width, 0);
+    }
+
+    #[test]
+    fn combining_marks_do_not_consume_a_column() {
+        let mut grid = TerminalGrid::new(8, 2);
+        grid.put_char('e');
+        grid.put_char('\u{301}');
+        grid.put_char('x');
+        grid.put_char('\u{20dd}');
+
+        assert_eq!(grid.cursor_col, 2);
+        assert_eq!(grid.cells[0][0].ch, 'é');
+        assert_eq!(grid.cells[0][1].ch, 'x');
+        assert_eq!(grid.cells[0][1].combining, "\u{20dd}");
+    }
+
+    #[test]
+    fn wide_glyph_wraps_before_the_final_column() {
+        let mut grid = TerminalGrid::new(4, 2);
+        for c in "abc한".chars() {
+            grid.put_char(c);
+        }
+
+        assert_eq!((grid.cursor_row, grid.cursor_col), (1, 2));
+        assert_eq!(grid.cells[0][3].ch, ' ');
+        assert_eq!(grid.cells[1][0].ch, '한');
+        assert_eq!(grid.cells[1][0].width, 2);
+        assert_eq!(grid.cells[1][1].width, 0);
+    }
+
+    #[test]
+    fn backspace_moves_physical_columns_and_edits_repair_wide_boundaries() {
+        let mut grid = TerminalGrid::new(8, 2);
+        grid.put_char('한');
+        grid.put_char('A');
+
+        grid.backspace_cursor();
+        assert_eq!(grid.cursor_col, 2);
+        grid.backspace_cursor();
+        assert_eq!(grid.cursor_col, 1);
+
+        grid.delete_chars(1);
+        assert_eq!(grid.cells[0][0].ch, 'A');
+        assert_no_orphan_continuations(&grid, 0);
+
+        let mut insert_grid = TerminalGrid::new(8, 2);
+        insert_grid.put_char('한');
+        insert_grid.set_cursor_col(1);
+        insert_grid.insert_chars(1);
+        assert_eq!(insert_grid.cells[0][0].ch, ' ');
+        assert_eq!(insert_grid.cells[0][1].ch, '한');
+        assert_no_orphan_continuations(&insert_grid, 0);
+    }
+
+    #[test]
+    fn zsh_style_wide_erase_does_not_enter_the_prompt() {
+        let mut grid = TerminalGrid::new(24, 2);
+        let prompt_end = "/tmp/project $ ".chars().count();
+
+        // Line editors erase a two-column glyph using physical-column cursor
+        // controls. Each Backspace must move exactly one column, even when it
+        // temporarily lands on a continuation cell.
+        feed(&mut grid, "/tmp/project $ 한\u{8}\u{8}  \u{8}\u{8}");
+
+        assert_eq!(grid.cursor_col, prompt_end);
+        assert_eq!(row_text(&grid, 0), "/tmp/project $");
+        assert_no_orphan_continuations(&grid, 0);
+    }
+
+    #[test]
+    fn resize_removes_a_wide_glyph_split_by_the_new_edge() {
+        let mut grid = TerminalGrid::new(3, 2);
+        grid.put_char('A');
+        grid.put_char('한');
+        grid.resize(2, 2);
+
+        assert_eq!(grid.cells[0][0].ch, 'A');
+        assert_eq!(grid.cells[0][1].ch, ' ');
+        assert_no_orphan_continuations(&grid, 0);
+    }
+
+    #[test]
+    fn erase_expands_across_a_wide_glyph() {
+        let mut grid = TerminalGrid::new(6, 2);
+        grid.put_char('한');
+        grid.put_char('A');
+
+        grid.erase_range(0, 1, 2);
+
+        assert_eq!(grid.cells[0][0].ch, ' ');
+        assert_eq!(grid.cells[0][1].ch, ' ');
+        assert_eq!(grid.cells[0][2].ch, 'A');
+        assert_no_orphan_continuations(&grid, 0);
+    }
+
+    #[test]
+    fn scrollback_resize_repairs_a_wide_glyph_at_the_edge() {
+        let mut grid = TerminalGrid::new(3, 1);
+        for c in "A한X".chars() {
+            grid.put_char(c);
+        }
+        assert_eq!(grid.scrollback.len(), 1);
+
+        grid.resize(2, 1);
+
+        assert_eq!(grid.scrollback[0][0].ch, 'A');
+        assert_eq!(grid.scrollback[0][1].ch, ' ');
+        for col in 0..grid.cols {
+            assert_ne!(grid.scrollback[0][col].width, 0);
+        }
+    }
+
+    #[test]
+    fn mixed_ascii_and_hangul_cursor_matches_terminal_columns() {
+        let mut grid = TerminalGrid::new(10, 2);
+        for c in "A한B".chars() {
+            grid.put_char(c);
+        }
+
+        assert_eq!(grid.cursor_col, 4);
+        assert_eq!(grid.cells[0][0].ch, 'A');
+        assert_eq!(grid.cells[0][1].ch, '한');
+        assert_eq!(grid.cells[0][2].width, 0);
+        assert_eq!(grid.cells[0][3].ch, 'B');
     }
 }

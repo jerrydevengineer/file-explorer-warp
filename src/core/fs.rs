@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use serde::{Deserialize, Serialize};
+
+use crate::core::display_text;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileKind {
@@ -89,7 +91,7 @@ pub fn read_dir(path: &Path, show_hidden: bool) -> Vec<FileEntry> {
     };
 
     for entry in dir.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
+        let name = display_text::os_str(&entry.file_name());
         if !show_hidden && name.starts_with('.') {
             continue;
         }
@@ -107,13 +109,9 @@ pub fn read_dir(path: &Path, show_hidden: bool) -> Vec<FileEntry> {
             FileKind::File
         };
 
-        let size = meta.as_ref().and_then(|m| {
-            if m.is_file() {
-                Some(m.len())
-            } else {
-                None
-            }
-        });
+        let size = meta
+            .as_ref()
+            .and_then(|m| if m.is_file() { Some(m.len()) } else { None });
 
         let modified = meta.as_ref().and_then(|m| m.modified().ok());
 
@@ -133,8 +131,8 @@ pub fn read_dir(path: &Path, show_hidden: bool) -> Vec<FileEntry> {
 pub fn sort_entries(entries: &mut Vec<FileEntry>, col: SortColumn, order: SortOrder) {
     entries.sort_by(|a, b| {
         // Directories always first
-        let dir_cmp = matches!(b.kind, FileKind::Directory)
-            .cmp(&matches!(a.kind, FileKind::Directory));
+        let dir_cmp =
+            matches!(b.kind, FileKind::Directory).cmp(&matches!(a.kind, FileKind::Directory));
         if dir_cmp != std::cmp::Ordering::Equal {
             return dir_cmp;
         }
