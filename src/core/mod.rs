@@ -5,6 +5,7 @@ pub mod fs;
 pub mod fs_watch;
 pub mod global_tags;
 pub mod search;
+pub mod session;
 pub mod tags;
 pub mod terminal;
 pub mod themes;

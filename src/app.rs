@@ -1,6 +1,7 @@
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::core::terminal::TerminalState;
 use crate::core::{
@@ -11,6 +12,9 @@ use crate::core::{
     fs_watch::DirectoryWatcher,
     global_tags::GlobalTags,
     search::SearchEngine,
+    session::{
+        session_path, PaneSession, SavedPaneSide, SessionState, TabSession, SESSION_VERSION,
+    },
 };
 use crate::git::{diff as git_diff, graph as git_graph, operations as git_ops, repo as git_repo};
 use crate::platform::{clipboard, opener, quicklook, share};
@@ -529,6 +533,147 @@ pub enum PaneSide {
     Right,
 }
 
+const MAX_RESTORED_TABS_PER_PANE: usize = 64;
+const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
+const SESSION_SAVE_RETRY: Duration = Duration::from_secs(5);
+
+struct PendingSessionSave {
+    snapshot: SessionState,
+    deadline: Instant,
+}
+
+struct RestoredBrowserSession {
+    left: PaneState,
+    right: Option<PaneState>,
+    focus: PaneSide,
+    split_ratio: f32,
+}
+
+fn normalized_split_ratio(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.15, 0.85)
+    } else {
+        0.5
+    }
+}
+
+fn pane_session(pane: &PaneState) -> PaneSession {
+    PaneSession {
+        tabs: pane
+            .tabs
+            .iter()
+            .map(|tab| TabSession {
+                path: tab.current_path.clone(),
+            })
+            .collect(),
+        active_tab: pane.active_tab,
+    }
+}
+
+fn browser_session_snapshot(
+    left: &PaneState,
+    right: Option<&PaneState>,
+    focus: PaneSide,
+    split_ratio: f32,
+) -> SessionState {
+    let saved_focus = if right.is_some() && focus == PaneSide::Right {
+        SavedPaneSide::Right
+    } else {
+        SavedPaneSide::Left
+    };
+    SessionState {
+        version: SESSION_VERSION,
+        left: pane_session(left),
+        right: right.map(pane_session),
+        focus: saved_focus,
+        split_ratio: normalized_split_ratio(split_ratio),
+    }
+}
+
+fn resolve_saved_directory(path: &PathBuf, fallback: &PathBuf) -> PathBuf {
+    if path.is_absolute() && path.is_dir() {
+        return path.clone();
+    }
+    if path.is_absolute() {
+        if let Some(directory) = nearest_existing_directory(path) {
+            return directory;
+        }
+    }
+    fallback.clone()
+}
+
+fn restore_pane(
+    saved: &PaneSession,
+    fallback: &PathBuf,
+    show_hidden: bool,
+) -> Option<PaneState> {
+    let tabs: Vec<_> = saved
+        .tabs
+        .iter()
+        .take(MAX_RESTORED_TABS_PER_PANE)
+        .map(|tab| TabState::new(resolve_saved_directory(&tab.path, fallback), show_hidden))
+        .collect();
+    if tabs.is_empty() {
+        return None;
+    }
+    let active_tab = saved.active_tab.min(tabs.len() - 1);
+    Some(PaneState { tabs, active_tab })
+}
+
+fn restore_browser_session(
+    saved: Option<&SessionState>,
+    fallback: &PathBuf,
+    show_hidden: bool,
+) -> RestoredBrowserSession {
+    let Some(saved) = saved else {
+        return RestoredBrowserSession {
+            left: PaneState::new(fallback.clone(), show_hidden),
+            right: None,
+            focus: PaneSide::Left,
+            split_ratio: 0.5,
+        };
+    };
+
+    let left = restore_pane(&saved.left, fallback, show_hidden)
+        .unwrap_or_else(|| PaneState::new(fallback.clone(), show_hidden));
+    let right = saved
+        .right
+        .as_ref()
+        .and_then(|pane| restore_pane(pane, fallback, show_hidden));
+    let focus = if right.is_some() && saved.focus == SavedPaneSide::Right {
+        PaneSide::Right
+    } else {
+        PaneSide::Left
+    };
+    RestoredBrowserSession {
+        left,
+        right,
+        focus,
+        split_ratio: normalized_split_ratio(saved.split_ratio),
+    }
+}
+
+fn update_pending_session(
+    last_saved: Option<&SessionState>,
+    pending: &mut Option<PendingSessionSave>,
+    snapshot: SessionState,
+    now: Instant,
+) {
+    if last_saved == Some(&snapshot) {
+        *pending = None;
+        return;
+    }
+    if pending
+        .as_ref()
+        .is_none_or(|pending| pending.snapshot != snapshot)
+    {
+        *pending = Some(PendingSessionSave {
+            snapshot,
+            deadline: now + SESSION_SAVE_DEBOUNCE,
+        });
+    }
+}
+
 struct TabDrag {
     from: PaneSide,
     tab_idx: usize,
@@ -572,6 +717,10 @@ pub struct App {
     git_panel: GitPanelState,
     // ── Filesystem auto-refresh ───────────────────────────────────────────────
     directory_watcher: Option<DirectoryWatcher>,
+    // ── Browser session persistence ──────────────────────────────────────────
+    last_saved_session: Option<SessionState>,
+    pending_session_save: Option<PendingSessionSave>,
+    session_save_error_logged: bool,
     // ── Terminal panel ────────────────────────────────────────────────────────
     terminal_open: bool,
     terminals: Vec<TerminalState>,
@@ -604,10 +753,29 @@ impl App {
         let start_path = config
             .last_path
             .clone()
-            .filter(|p| p.exists())
+            .filter(|p| p.is_dir())
             .unwrap_or_else(|| {
                 PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()))
             });
+        let loaded_session = match SessionState::load() {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!(
+                    "[session] could not load {}: {error}",
+                    session_path().display()
+                );
+                None
+            }
+        };
+        let restored =
+            restore_browser_session(loaded_session.as_ref(), &start_path, config.show_hidden);
+        let initial_snapshot = browser_session_snapshot(
+            &restored.left,
+            restored.right.as_ref(),
+            restored.focus,
+            restored.split_ratio,
+        );
+        let last_saved_session = loaded_session.filter(|saved| saved == &initial_snapshot);
         let watcher_ctx = cc.egui_ctx.clone();
         let directory_watcher = DirectoryWatcher::new(Arc::new(move || {
             watcher_ctx.request_repaint();
@@ -619,11 +787,11 @@ impl App {
         .ok();
 
         Self {
-            left: PaneState::new(start_path, config.show_hidden),
-            right: None,
-            focus: PaneSide::Left,
+            left: restored.left,
+            right: restored.right,
+            focus: restored.focus,
             tab_drag: None,
-            split_ratio: 0.5,
+            split_ratio: restored.split_ratio,
             content_rect: egui::Rect::EVERYTHING,
             config,
             bookmarks,
@@ -647,6 +815,9 @@ impl App {
             git_panel_open: false,
             git_panel: GitPanelState::default(),
             directory_watcher,
+            last_saved_session,
+            pending_session_save: None,
+            session_save_error_logged: false,
             terminal_open: false,
             terminals: Vec::new(),
             terminal_active: 0,
@@ -1182,6 +1353,77 @@ impl App {
         }
         if let Some(delay) = repaint_after {
             ctx.request_repaint_after(delay);
+        }
+    }
+
+    fn session_snapshot(&self) -> SessionState {
+        browser_session_snapshot(
+            &self.left,
+            self.right.as_ref(),
+            self.focus,
+            self.split_ratio,
+        )
+    }
+
+    fn process_session_persistence(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let snapshot = self.session_snapshot();
+        update_pending_session(
+            self.last_saved_session.as_ref(),
+            &mut self.pending_session_save,
+            snapshot,
+            now,
+        );
+
+        let Some(pending) = self.pending_session_save.as_ref() else {
+            return;
+        };
+        if now < pending.deadline {
+            ctx.request_repaint_after(pending.deadline.saturating_duration_since(now));
+            return;
+        }
+
+        let pending = self.pending_session_save.take().unwrap();
+        match pending.snapshot.save() {
+            Ok(()) => {
+                self.last_saved_session = Some(pending.snapshot);
+                self.session_save_error_logged = false;
+            }
+            Err(error) => {
+                if !self.session_save_error_logged {
+                    eprintln!(
+                        "[session] could not save {}: {error}",
+                        session_path().display()
+                    );
+                    self.session_save_error_logged = true;
+                }
+                self.pending_session_save = Some(PendingSessionSave {
+                    snapshot: pending.snapshot,
+                    deadline: now + SESSION_SAVE_RETRY,
+                });
+                ctx.request_repaint_after(SESSION_SAVE_RETRY);
+            }
+        }
+    }
+
+    fn save_session_now(&mut self) {
+        let snapshot = self.session_snapshot();
+        if self.last_saved_session.as_ref() == Some(&snapshot) {
+            self.pending_session_save = None;
+            return;
+        }
+        match snapshot.save() {
+            Ok(()) => {
+                self.last_saved_session = Some(snapshot);
+                self.pending_session_save = None;
+                self.session_save_error_logged = false;
+            }
+            Err(error) => {
+                eprintln!(
+                    "[session] could not save {} during shutdown: {error}",
+                    session_path().display()
+                );
+            }
         }
     }
 
@@ -3019,6 +3261,12 @@ impl eframe::App for App {
                 r.active_mut().dragging_paths = None;
             }
         }
+
+        self.process_session_persistence(ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_session_now();
     }
 }
 
@@ -3211,9 +3459,13 @@ fn apply_custom_theme(ctx: &egui::Context, colors: &crate::core::themes::ThemeCo
 #[cfg(test)]
 mod clipboard_tests {
     use super::{
-        classify_external_drag_operation, external_drag_source_dirs,
+        browser_session_snapshot, classify_external_drag_operation, external_drag_source_dirs,
         file_list_owns_keyboard_commands, move_error_message, move_path, paste_paths,
-        paste_reload_dirs, push_unique_path, ClipboardKind, ExternalDragResult, TabState,
+        paste_reload_dirs, push_unique_path, restore_browser_session, update_pending_session,
+        ClipboardKind, ExternalDragResult, PaneSide, PaneState, TabState, SESSION_SAVE_DEBOUNCE,
+    };
+    use crate::core::session::{
+        PaneSession, SavedPaneSide, SessionState, TabSession, SESSION_VERSION,
     };
     use std::path::PathBuf;
 
@@ -3478,5 +3730,137 @@ mod clipboard_tests {
         );
         assert_eq!(tab.current_path, root.0);
         assert!(tab.list_state.selected.is_empty());
+    }
+
+    #[test]
+    fn browser_session_restores_tab_order_active_tabs_and_layout() {
+        let root = TestDir::new("session-layout");
+        let first = root.0.join("first");
+        let second = root.0.join("한글 folder");
+        let right = root.0.join("right");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        let saved = SessionState {
+            version: SESSION_VERSION,
+            left: PaneSession {
+                tabs: vec![
+                    TabSession {
+                        path: first.clone(),
+                    },
+                    TabSession {
+                        path: second.clone(),
+                    },
+                ],
+                active_tab: 1,
+            },
+            right: Some(PaneSession {
+                tabs: vec![TabSession {
+                    path: right.clone(),
+                }],
+                active_tab: 0,
+            }),
+            focus: SavedPaneSide::Right,
+            split_ratio: 0.37,
+        };
+
+        let restored = restore_browser_session(Some(&saved), &root.0, false);
+
+        assert_eq!(
+            restored
+                .left
+                .tabs
+                .iter()
+                .map(|tab| tab.current_path.clone())
+                .collect::<Vec<_>>(),
+            vec![first, second],
+        );
+        assert_eq!(restored.left.active_tab, 1);
+        assert_eq!(restored.right.as_ref().unwrap().active_tab, 0);
+        assert_eq!(restored.right.as_ref().unwrap().tabs[0].current_path, right);
+        assert!(restored.focus == PaneSide::Right);
+        assert_eq!(restored.split_ratio, 0.37);
+        assert_eq!(
+            browser_session_snapshot(
+                &restored.left,
+                restored.right.as_ref(),
+                restored.focus,
+                restored.split_ratio,
+            ),
+            saved,
+        );
+    }
+
+    #[test]
+    fn browser_session_repairs_missing_paths_and_invalid_layout() {
+        let root = TestDir::new("session-repair");
+        let missing = root.0.join("removed").join("nested");
+        let saved = SessionState {
+            version: SESSION_VERSION,
+            left: PaneSession {
+                tabs: vec![TabSession { path: missing }],
+                active_tab: 99,
+            },
+            right: Some(PaneSession {
+                tabs: Vec::new(),
+                active_tab: 22,
+            }),
+            focus: SavedPaneSide::Right,
+            split_ratio: f32::INFINITY,
+        };
+
+        let restored = restore_browser_session(Some(&saved), &root.0, false);
+
+        assert_eq!(restored.left.tabs.len(), 1);
+        assert_eq!(restored.left.tabs[0].current_path, root.0);
+        assert_eq!(restored.left.active_tab, 0);
+        assert!(restored.right.is_none());
+        assert!(restored.focus == PaneSide::Left);
+        assert_eq!(restored.split_ratio, 0.5);
+    }
+
+    #[test]
+    fn session_snapshot_excludes_transient_selection_and_tag_state() {
+        let root = TestDir::new("session-transient");
+        let selected = root.0.join("selected.txt");
+        std::fs::write(&selected, "selected").unwrap();
+        let mut pane = PaneState::new(root.0.clone(), false);
+        let before = browser_session_snapshot(&pane, None, PaneSide::Left, 0.5);
+
+        pane.active_mut().list_state.select_only(selected);
+        pane.active_mut().tag_filter = Some("Red".to_string());
+        let after = browser_session_snapshot(&pane, None, PaneSide::Left, 0.5);
+
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn session_save_debounce_tracks_the_newest_layout_and_cancels_reverted_changes() {
+        let root = TestDir::new("session-debounce");
+        let pane = PaneState::new(root.0.clone(), false);
+        let saved = browser_session_snapshot(&pane, None, PaneSide::Left, 0.5);
+        let mut changed = saved.clone();
+        changed.split_ratio = 0.6;
+        let start = std::time::Instant::now();
+        let mut pending = None;
+
+        update_pending_session(Some(&saved), &mut pending, changed.clone(), start);
+        assert_eq!(
+            pending.as_ref().unwrap().deadline,
+            start + SESSION_SAVE_DEBOUNCE,
+        );
+
+        let mut newest = changed;
+        newest.split_ratio = 0.7;
+        let later = start + std::time::Duration::from_millis(100);
+        update_pending_session(Some(&saved), &mut pending, newest.clone(), later);
+        assert_eq!(pending.as_ref().unwrap().snapshot, newest);
+        assert_eq!(
+            pending.as_ref().unwrap().deadline,
+            later + SESSION_SAVE_DEBOUNCE,
+        );
+
+        update_pending_session(Some(&saved), &mut pending, saved.clone(), later);
+        assert!(pending.is_none());
     }
 }
