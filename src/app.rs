@@ -7,7 +7,8 @@ use crate::core::{
     bookmarks::Bookmarks,
     config::AppConfig,
     display_text,
-    fs::{read_dir, sort_entries, FileEntry},
+    fs::{read_dir_checked, sort_entries, FileEntry},
+    fs_watch::DirectoryWatcher,
     global_tags::GlobalTags,
     search::SearchEngine,
 };
@@ -36,6 +37,13 @@ pub struct TabState {
     history_pos: usize,
 }
 
+#[derive(Debug)]
+pub enum ReloadOutcome {
+    Reloaded,
+    CurrentDirectoryMissing,
+    Failed(String),
+}
+
 impl TabState {
     pub fn new(path: PathBuf, show_hidden: bool) -> Self {
         let mut tab = Self {
@@ -52,21 +60,46 @@ impl TabState {
         tab
     }
 
-    pub fn reload(&mut self, show_hidden: bool) {
+    pub fn reload(&mut self, show_hidden: bool) -> ReloadOutcome {
         let selected = self.list_state.selected.clone();
         let anchor = self.list_state.selection_anchor.clone();
-        self.entries = read_dir(&self.current_path, show_hidden);
+        let mut entries = match read_dir_checked(&self.current_path, show_hidden) {
+            Ok(entries) => entries,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound || !self.current_path.is_dir() =>
+            {
+                return ReloadOutcome::CurrentDirectoryMissing;
+            }
+            Err(error) => return ReloadOutcome::Failed(error.to_string()),
+        };
         sort_entries(
-            &mut self.entries,
+            &mut entries,
             self.list_state.sort_col,
             self.list_state.sort_order,
         );
+        self.entries = entries;
         self.list_state.selected = selected
             .into_iter()
             .filter(|path| self.entries.iter().any(|entry| &entry.path == path))
             .collect();
         self.list_state.selection_anchor =
             anchor.filter(|path| self.entries.iter().any(|entry| &entry.path == path));
+        if self
+            .list_state
+            .renaming
+            .as_ref()
+            .is_some_and(|renaming| !renaming.path.exists())
+        {
+            self.list_state.renaming = None;
+        }
+        ReloadOutcome::Reloaded
+    }
+
+    fn reload_after_path_change(&mut self, show_hidden: bool) {
+        if !matches!(self.reload(show_hidden), ReloadOutcome::Reloaded) {
+            self.entries.clear();
+            self.list_state.clear_selection();
+        }
     }
 
     pub fn navigate(&mut self, path: PathBuf, show_hidden: bool) -> bool {
@@ -77,7 +110,7 @@ impl TabState {
             self.history_pos = self.history.len() - 1;
             self.current_path = path;
             self.set_tag_view(None, None);
-            self.reload(show_hidden);
+            self.reload_after_path_change(show_hidden);
             true
         } else {
             false
@@ -116,7 +149,7 @@ impl TabState {
             self.history_pos -= 1;
             self.current_path = self.history[self.history_pos].clone();
             self.set_tag_view(None, None);
-            self.reload(show_hidden);
+            self.reload_after_path_change(show_hidden);
         }
     }
 
@@ -126,6 +159,56 @@ impl TabState {
         } else {
             "/".to_string()
         }
+    }
+
+    fn follow_external_directory_rename(
+        &mut self,
+        old_path: &PathBuf,
+        new_path: &PathBuf,
+        show_hidden: bool,
+    ) -> bool {
+        if self.current_path != *old_path || !new_path.is_dir() {
+            return false;
+        }
+
+        self.current_path = new_path.clone();
+        if let Some(history_path) = self.history.get_mut(self.history_pos) {
+            *history_path = new_path.clone();
+        }
+        for selected in &mut self.list_state.selected {
+            *selected = remap_path_prefix(selected, old_path, new_path);
+        }
+        self.list_state.selection_anchor = self
+            .list_state
+            .selection_anchor
+            .as_ref()
+            .map(|path| remap_path_prefix(path, old_path, new_path));
+        if let Some(renaming) = &mut self.list_state.renaming {
+            renaming.path = remap_path_prefix(&renaming.path, old_path, new_path);
+        }
+        if let Some(paths) = &mut self.dragging_paths {
+            for path in paths {
+                *path = remap_path_prefix(path, old_path, new_path);
+            }
+        }
+        self.reload_after_path_change(show_hidden);
+        true
+    }
+
+    fn recover_missing_directory(&mut self, show_hidden: bool) -> Option<(PathBuf, PathBuf)> {
+        if self.current_path.is_dir() {
+            return None;
+        }
+        let old_path = self.current_path.clone();
+        let fallback = nearest_existing_directory(&old_path)?;
+        self.current_path = fallback.clone();
+        if let Some(history_path) = self.history.get_mut(self.history_pos) {
+            *history_path = fallback.clone();
+        }
+        self.set_tag_view(None, None);
+        self.dragging_paths = None;
+        let _ = self.reload(show_hidden);
+        Some((old_path, fallback))
     }
 }
 
@@ -414,6 +497,23 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
+fn remap_path_prefix(path: &PathBuf, old_prefix: &PathBuf, new_prefix: &PathBuf) -> PathBuf {
+    path.strip_prefix(old_prefix)
+        .map(|suffix| new_prefix.join(suffix))
+        .unwrap_or_else(|_| path.clone())
+}
+
+fn nearest_existing_directory(path: &PathBuf) -> Option<PathBuf> {
+    let mut candidate = path.parent();
+    while let Some(directory) = candidate {
+        if directory.is_dir() {
+            return Some(directory.to_path_buf());
+        }
+        candidate = directory.parent();
+    }
+    None
+}
+
 fn file_list_owns_keyboard_commands(
     wants_keyboard_input: bool,
     terminal_grid_has_focus: bool,
@@ -470,6 +570,8 @@ pub struct App {
     git_checked_path: Option<PathBuf>, // last path we ran detect_repo on
     git_panel_open: bool,
     git_panel: GitPanelState,
+    // ── Filesystem auto-refresh ───────────────────────────────────────────────
+    directory_watcher: Option<DirectoryWatcher>,
     // ── Terminal panel ────────────────────────────────────────────────────────
     terminal_open: bool,
     terminals: Vec<TerminalState>,
@@ -506,6 +608,15 @@ impl App {
             .unwrap_or_else(|| {
                 PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()))
             });
+        let watcher_ctx = cc.egui_ctx.clone();
+        let directory_watcher = DirectoryWatcher::new(Arc::new(move || {
+            watcher_ctx.request_repaint();
+        }))
+        .map_err(|error| {
+            eprintln!("[watch] auto-refresh unavailable: {error}");
+            error
+        })
+        .ok();
 
         Self {
             left: PaneState::new(start_path, config.show_hidden),
@@ -535,6 +646,7 @@ impl App {
             git_checked_path: None,
             git_panel_open: false,
             git_panel: GitPanelState::default(),
+            directory_watcher,
             terminal_open: false,
             terminals: Vec::new(),
             terminal_active: 0,
@@ -959,17 +1071,117 @@ impl App {
             return;
         }
         let show_hidden = self.config.show_hidden;
+        let mut fallbacks = Vec::new();
+        let mut errors = Vec::new();
         for tab in &mut self.left.tabs {
             if dirs.contains(&tab.current_path) {
-                tab.reload(show_hidden);
+                match tab.reload(show_hidden) {
+                    ReloadOutcome::Reloaded => {}
+                    ReloadOutcome::CurrentDirectoryMissing => {
+                        if let Some(fallback) = tab.recover_missing_directory(show_hidden) {
+                            if !fallbacks.contains(&fallback) {
+                                fallbacks.push(fallback);
+                            }
+                        }
+                    }
+                    ReloadOutcome::Failed(error) => {
+                        errors.push((tab.current_path.clone(), error));
+                    }
+                }
             }
         }
         if let Some(right) = &mut self.right {
             for tab in &mut right.tabs {
                 if dirs.contains(&tab.current_path) {
-                    tab.reload(show_hidden);
+                    match tab.reload(show_hidden) {
+                        ReloadOutcome::Reloaded => {}
+                        ReloadOutcome::CurrentDirectoryMissing => {
+                            if let Some(fallback) = tab.recover_missing_directory(show_hidden) {
+                                if !fallbacks.contains(&fallback) {
+                                    fallbacks.push(fallback);
+                                }
+                            }
+                        }
+                        ReloadOutcome::Failed(error) => {
+                            errors.push((tab.current_path.clone(), error));
+                        }
+                    }
                 }
             }
+        }
+        for (old_path, fallback) in fallbacks {
+            self.toasts.push(format!(
+                "Folder moved or removed: {}\nShowing: {}",
+                display_text::path(&old_path),
+                display_text::path(&fallback),
+            ));
+        }
+        for (path, error) in errors {
+            eprintln!("[watch] could not refresh {}: {error}", path.display());
+        }
+    }
+
+    fn displayed_directories(&self) -> Vec<PathBuf> {
+        let mut directories = Vec::new();
+        for tab in &self.left.tabs {
+            push_unique_path(&mut directories, tab.current_path.clone());
+        }
+        if let Some(right) = &self.right {
+            for tab in &right.tabs {
+                push_unique_path(&mut directories, tab.current_path.clone());
+            }
+        }
+        directories
+    }
+
+    fn follow_external_directory_renames(&mut self, renames: &[(PathBuf, PathBuf)]) {
+        if renames.is_empty() {
+            return;
+        }
+        let show_hidden = self.config.show_hidden;
+        for (old_path, new_path) in renames {
+            let mut followed = false;
+            for tab in &mut self.left.tabs {
+                followed |= tab.follow_external_directory_rename(old_path, new_path, show_hidden);
+            }
+            if let Some(right) = &mut self.right {
+                for tab in &mut right.tabs {
+                    followed |=
+                        tab.follow_external_directory_rename(old_path, new_path, show_hidden);
+                }
+            }
+            if followed {
+                eprintln!(
+                    "[watch] followed directory rename {} -> {}",
+                    old_path.display(),
+                    new_path.display(),
+                );
+            }
+        }
+    }
+
+    fn process_directory_watcher(&mut self, ctx: &egui::Context) {
+        let displayed_dirs = self.displayed_directories();
+        let now = std::time::Instant::now();
+        let Some(watcher) = &mut self.directory_watcher else {
+            return;
+        };
+
+        let update = watcher.drain_events(&displayed_dirs, now);
+        let mut errors = update.errors;
+        errors.extend(watcher.sync_paths(&displayed_dirs, now));
+        let refresh_dirs = watcher.take_due_refresh(now);
+        let repaint_after = watcher.time_until_refresh(now);
+
+        for error in errors {
+            eprintln!("[watch] {error}");
+        }
+        self.follow_external_directory_renames(&update.directory_renames);
+        if let Some(dirs) = refresh_dirs {
+            self.reload_tabs_in_dirs(&dirs);
+        }
+        if let Some(delay) = repaint_after {
+            ctx.request_repaint_after(delay);
         }
     }
 
@@ -1181,6 +1393,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.process_directory_watcher(ctx);
         let pointer_released = ctx.input(|i| i.pointer.any_released());
 
         // ── External drag-end reload ──────────────────────────────────────────
@@ -3219,5 +3432,51 @@ mod clipboard_tests {
         assert!(tab.list_state.selection_anchor.is_none());
         assert_eq!(tab.tag_filter.as_deref(), Some("Red"));
         assert_eq!(tab.visible_entry_paths(), vec![result]);
+    }
+
+    #[test]
+    fn external_directory_rename_follows_the_folder_and_selection() {
+        let root = TestDir::new("watched-directory-rename");
+        let old_directory = root.0.join("old");
+        let new_directory = root.0.join("new");
+        std::fs::create_dir(&old_directory).unwrap();
+        let old_file = old_directory.join("selected.txt");
+        std::fs::write(&old_file, "selected").unwrap();
+        let mut tab = TabState::new(old_directory.clone(), false);
+        tab.list_state.select_only(old_file);
+        std::fs::rename(&old_directory, &new_directory).unwrap();
+
+        assert!(tab.follow_external_directory_rename(
+            &old_directory,
+            &new_directory,
+            false,
+        ));
+        assert_eq!(tab.current_path, new_directory);
+        let expected_selection = tab.current_path.join("selected.txt");
+        assert_eq!(
+            tab.list_state.primary_selection(),
+            Some(&expected_selection),
+        );
+        assert_eq!(tab.entries.len(), 1);
+    }
+
+    #[test]
+    fn removed_current_directory_falls_back_to_existing_parent() {
+        let root = TestDir::new("watched-directory-remove");
+        let removed = root.0.join("removed");
+        std::fs::create_dir(&removed).unwrap();
+        let mut tab = TabState::new(removed.clone(), false);
+        std::fs::remove_dir(&removed).unwrap();
+
+        assert!(matches!(
+            tab.reload(false),
+            super::ReloadOutcome::CurrentDirectoryMissing,
+        ));
+        assert_eq!(
+            tab.recover_missing_directory(false),
+            Some((removed, root.0.clone())),
+        );
+        assert_eq!(tab.current_path, root.0);
+        assert!(tab.list_state.selected.is_empty());
     }
 }

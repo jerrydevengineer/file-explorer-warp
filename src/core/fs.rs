@@ -83,12 +83,9 @@ pub enum SortOrder {
     Descending,
 }
 
-pub fn read_dir(path: &Path, show_hidden: bool) -> Vec<FileEntry> {
+pub fn read_dir_checked(path: &Path, show_hidden: bool) -> std::io::Result<Vec<FileEntry>> {
     let mut entries = Vec::new();
-
-    let Ok(dir) = std::fs::read_dir(path) else {
-        return entries;
-    };
+    let dir = std::fs::read_dir(path)?;
 
     for entry in dir.flatten() {
         let name = display_text::os_str(&entry.file_name());
@@ -125,7 +122,7 @@ pub fn read_dir(path: &Path, show_hidden: bool) -> Vec<FileEntry> {
         });
     }
 
-    entries
+    Ok(entries)
 }
 
 pub fn sort_entries(entries: &mut Vec<FileEntry>, col: SortColumn, order: SortOrder) {

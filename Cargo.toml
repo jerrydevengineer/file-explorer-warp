@@ -21,6 +21,7 @@ vte = "0.13"
 anyhow = "1"
 unicode-normalization = "0.1"
 unicode-width = "0.2"
+notify = { version = "8.2", default-features = false, features = ["macos_kqueue"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"

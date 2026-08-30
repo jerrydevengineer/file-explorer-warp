@@ -2,6 +2,7 @@ pub mod bookmarks;
 pub mod config;
 pub mod display_text;
 pub mod fs;
+pub mod fs_watch;
 pub mod global_tags;
 pub mod search;
 pub mod tags;
