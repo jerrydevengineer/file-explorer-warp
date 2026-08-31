@@ -732,6 +732,8 @@ pub struct App {
     #[cfg(target_os = "macos")]
     external_drag_active: bool,
     #[cfg(target_os = "macos")]
+    next_external_drag_gesture_id: u64,
+    #[cfg(target_os = "macos")]
     pending_external_drag_reload: Option<(std::time::Instant, Vec<std::path::PathBuf>)>,
 }
 
@@ -825,6 +827,8 @@ impl App {
             custom_themes,
             #[cfg(target_os = "macos")]
             external_drag_active: false,
+            #[cfg(target_os = "macos")]
+            next_external_drag_gesture_id: 1,
             #[cfg(target_os = "macos")]
             pending_external_drag_reload: None,
         }
@@ -3217,9 +3221,13 @@ impl eframe::App for App {
                 }
                 let path_refs: Vec<&std::path::Path> =
                     existing_paths.iter().map(PathBuf::as_path).collect();
-                if let Err(error) = crate::platform::drag::begin_external_drag(&path_refs) {
-                    self.toasts
-                        .push(format!("Could not start external drag: {}", error));
+                let gesture_id = self.next_external_drag_gesture_id;
+                self.next_external_drag_gesture_id = gesture_id.wrapping_add(1).max(1);
+                match crate::platform::drag::begin_external_drag(&path_refs, gesture_id) {
+                    Ok(_) => {}
+                    Err(error) => self
+                        .toasts
+                        .push(format!("Could not start external drag: {}", error)),
                 }
                 self.left.active_mut().dragging_paths = None;
                 if let Some(r) = &mut self.right {
