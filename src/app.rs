@@ -3280,6 +3280,22 @@ impl eframe::App for App {
 
 /// Render one pane (tab bar + file list) into a rect within the given `ui`.
 /// Returns (tab_bar_actions, file_list_actions, focus_clicked).
+const PANE_SECTION_SEPARATOR_HEIGHT: f32 = 1.0;
+
+fn pane_section_rects(content_rect: egui::Rect) -> (egui::Rect, egui::Rect) {
+    let tab_bottom = (content_rect.top() + tab_bar::strip_height()).min(content_rect.bottom());
+    let file_top = (tab_bottom + PANE_SECTION_SEPARATOR_HEIGHT).min(content_rect.bottom());
+    let tab_rect = egui::Rect::from_min_max(
+        content_rect.min,
+        egui::pos2(content_rect.right(), tab_bottom),
+    );
+    let file_rect = egui::Rect::from_min_max(
+        egui::pos2(content_rect.left(), file_top),
+        content_rect.max,
+    );
+    (tab_rect, file_rect)
+}
+
 fn render_pane(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -3294,7 +3310,6 @@ fn render_pane(
 ) -> (Vec<tab_bar::TabBarAction>, Vec<FileListAction>, bool) {
     let mut tab_actions = Vec::new();
     let mut file_actions = Vec::new();
-    let mut focus_clicked = false;
 
     // Draw 3 px accent bar using the parent painter BEFORE entering the child UI,
     // so it is never clipped by the child's narrower max_rect.
@@ -3314,60 +3329,114 @@ fn render_pane(
     };
     let content_rect =
         egui::Rect::from_min_max(egui::pos2(rect.min.x + bar_w, rect.min.y), rect.max);
+    let (tab_rect, file_rect) = pane_section_rects(content_rect);
 
     ui.allocate_new_ui(
         egui::UiBuilder::new()
-            .max_rect(content_rect)
-            .id_salt(pane_id),
+            .max_rect(tab_rect)
+            .id_salt((pane_id, "tabs")),
         |ui| {
-        ui.set_clip_rect(content_rect);
-
-        // Tab bar
-        let names = pane.tab_names();
-        let (tb_actions, _) = tab_bar::show(ui, &names, pane.active_tab, is_drop_target);
-        tab_actions = tb_actions;
-
-        ui.separator();
-
-        // File list
-        let ai = pane.active_tab;
-        {
-            let t = &mut pane.tabs[ai];
-                sort_entries(
-                    &mut t.entries,
-                    t.list_state.sort_col,
-                    t.list_state.sort_order,
-                );
-        }
-        let actions = {
-            let t = &mut pane.tabs[ai];
-            file_list::show(
-                    ui,
-                    &t.entries,
-                    &mut t.list_state,
-                    &t.current_path,
-                    t.tag_filter.as_deref(),
-                    global_tags,
-                    cut_paths,
-                    has_clipboard,
-                    t.dragging_paths.as_ref(),
-                t.tag_search_results.as_deref(),
-            )
-        };
-        file_actions = actions;
-
-        // Detect click to focus without creating an overlapping interactive widget
-        // (which would compete with file-list row interactions and swallow clicks).
-        focus_clicked = ui.input(|i| {
-            i.pointer.any_pressed()
-                    && i.pointer
-                        .press_origin()
-                        .map_or(false, |pos| rect.contains(pos))
-    });
+            ui.set_clip_rect(tab_rect);
+            let names = pane.tab_names();
+            let (tb_actions, _) =
+                tab_bar::show(ui, &names, pane.active_tab, is_drop_target);
+            tab_actions = tb_actions;
         },
     );
 
+    if file_rect.top() > tab_rect.bottom() {
+        ui.painter().hline(
+            content_rect.x_range(),
+            tab_rect.bottom(),
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
+    }
+
+    if file_rect.is_positive() {
+        ui.allocate_new_ui(
+            egui::UiBuilder::new()
+                .max_rect(file_rect)
+                .id_salt((pane_id, "files")),
+            |ui| {
+                ui.set_clip_rect(file_rect);
+                let ai = pane.active_tab;
+                {
+                    let t = &mut pane.tabs[ai];
+                    sort_entries(
+                        &mut t.entries,
+                        t.list_state.sort_col,
+                        t.list_state.sort_order,
+                    );
+                }
+                let actions = {
+                    let t = &mut pane.tabs[ai];
+                    file_list::show(
+                        ui,
+                        &t.entries,
+                        &mut t.list_state,
+                        &t.current_path,
+                        t.tag_filter.as_deref(),
+                        global_tags,
+                        cut_paths,
+                        has_clipboard,
+                        t.dragging_paths.as_ref(),
+                        t.tag_search_results.as_deref(),
+                    )
+                };
+                file_actions = actions;
+            },
+        );
+    }
+
+    // Detect click to focus without creating an overlapping interactive widget
+    // (which would compete with file-list row interactions and swallow clicks).
+    let focus_clicked = ui.input(|i| {
+        i.pointer.any_pressed()
+            && i.pointer
+                .press_origin()
+                .map_or(false, |pos| rect.contains(pos))
+    });
+
     (tab_actions, file_actions, focus_clicked)
+}
+
+#[cfg(test)]
+mod pane_layout_tests {
+    use super::{pane_section_rects, PANE_SECTION_SEPARATOR_HEIGHT};
+    use crate::ui::tab_bar;
+    use eframe::egui;
+
+    #[test]
+    fn tab_strip_and_file_content_have_independent_fixed_rectangles() {
+        let pane = egui::Rect::from_min_size(
+            egui::pos2(12.0, 24.0),
+            egui::vec2(360.0, 500.0),
+        );
+        let (tabs, files) = pane_section_rects(pane);
+
+        assert_eq!(tabs.width(), pane.width());
+        assert_eq!(tabs.height(), tab_bar::strip_height());
+        assert_eq!(files.width(), pane.width());
+        assert_eq!(files.bottom(), pane.bottom());
+        assert_eq!(
+            files.top(),
+            tabs.bottom() + PANE_SECTION_SEPARATOR_HEIGHT
+        );
+    }
+
+    #[test]
+    fn a_short_pane_never_produces_negative_content_geometry() {
+        let pane = egui::Rect::from_min_size(
+            egui::pos2(5.0, 8.0),
+            egui::vec2(100.0, 10.0),
+        );
+        let (tabs, files) = pane_section_rects(pane);
+
+        assert!(tabs.is_positive());
+        assert_eq!(tabs.bottom(), pane.bottom());
+        assert_eq!(files.height(), 0.0);
+        assert_eq!(files.width(), pane.width());
+    }
 }
 
 fn apply_theme(ctx: &egui::Context, theme: crate::core::config::Theme) {
