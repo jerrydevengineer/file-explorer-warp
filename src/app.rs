@@ -525,6 +525,79 @@ fn file_list_owns_keyboard_commands(
     !wants_keyboard_input && !terminal_grid_has_focus
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TabCycleDirection {
+    Previous,
+    Next,
+}
+
+fn cycle_tab_index(active_tab: usize, tab_count: usize, direction: TabCycleDirection) -> usize {
+    if tab_count <= 1 {
+        return 0;
+    }
+
+    let active_tab = active_tab.min(tab_count - 1);
+    match direction {
+        TabCycleDirection::Previous => {
+            if active_tab == 0 {
+                tab_count - 1
+            } else {
+                active_tab - 1
+            }
+        }
+        TabCycleDirection::Next => (active_tab + 1) % tab_count,
+    }
+}
+
+fn tab_cycle_key_event(event: &egui::Event) -> Option<(TabCycleDirection, bool)> {
+    let egui::Event::Key {
+        key,
+        physical_key,
+        pressed: true,
+        repeat,
+        modifiers,
+    } = event
+    else {
+        return None;
+    };
+
+    if !modifiers.command || !modifiers.shift || modifiers.alt {
+        return None;
+    }
+
+    let direction = if matches!(key, egui::Key::OpenCurlyBracket | egui::Key::OpenBracket)
+        || matches!(physical_key, Some(egui::Key::OpenBracket))
+    {
+        TabCycleDirection::Previous
+    } else if matches!(key, egui::Key::CloseCurlyBracket | egui::Key::CloseBracket)
+        || matches!(physical_key, Some(egui::Key::CloseBracket))
+    {
+        TabCycleDirection::Next
+    } else {
+        return None;
+    };
+
+    Some((direction, *repeat))
+}
+
+/// Remove browser-tab cycle shortcuts before focused text widgets or the
+/// embedded terminal can observe them. Repeated key-down events are consumed
+/// but intentionally do not cycle again.
+fn take_tab_cycle_shortcut(events: &mut Vec<egui::Event>) -> Option<TabCycleDirection> {
+    let mut shortcut = None;
+    events.retain(|event| {
+        let Some((direction, repeat)) = tab_cycle_key_event(event) else {
+            return true;
+        };
+
+        if !repeat && shortcut.is_none() {
+            shortcut = Some(direction);
+        }
+        false
+    });
+    shortcut
+}
+
 // ── Focus / drag ──────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1781,6 +1854,7 @@ impl eframe::App for App {
         let mut kb_toggle_hidden = false;
         let mut kb_switch_focus = false;
         let mut kb_switch_tab: Option<usize> = None;
+        let mut kb_cycle_tab: Option<TabCycleDirection> = None;
         let mut kb_open_search = false;
         let mut kb_toggle_git = false;
         let mut kb_toggle_terminal = false;
@@ -1886,6 +1960,7 @@ impl eframe::App for App {
 
         // Space must be consumed via input_mut so the ScrollArea never sees it.
         ctx.input_mut(|i| {
+            kb_cycle_tab = take_tab_cycle_shortcut(&mut i.events);
             if file_shortcuts_active && i.consume_key(egui::Modifiers::NONE, egui::Key::Space) {
                 kb_quicklook = true;
             }
@@ -2041,6 +2116,10 @@ impl eframe::App for App {
             if idx < n {
                 self.focused_pane_mut().active_tab = idx;
             }
+        }
+        if let Some(direction) = kb_cycle_tab {
+            let pane = self.focused_pane_mut();
+            pane.active_tab = cycle_tab_index(pane.active_tab, pane.tabs.len(), direction);
         }
         if kb_switch_focus {
             self.focus = if self.focus == PaneSide::Left && self.right.is_some() {
@@ -3537,9 +3616,11 @@ fn apply_custom_theme(ctx: &egui::Context, colors: &crate::core::themes::ThemeCo
 mod clipboard_tests {
     use super::{
         browser_session_snapshot, classify_external_drag_operation, external_drag_source_dirs,
-        file_list_owns_keyboard_commands, move_error_message, move_path, paste_paths,
-        paste_reload_dirs, push_unique_path, restore_browser_session, update_pending_session,
-        ClipboardKind, ExternalDragResult, PaneSide, PaneState, TabState, SESSION_SAVE_DEBOUNCE,
+        cycle_tab_index, file_list_owns_keyboard_commands, move_error_message, move_path,
+        paste_paths, paste_reload_dirs, push_unique_path, restore_browser_session,
+        tab_cycle_key_event, take_tab_cycle_shortcut, update_pending_session, ClipboardKind,
+        ExternalDragResult, PaneSide, PaneState, TabCycleDirection, TabState,
+        SESSION_SAVE_DEBOUNCE,
     };
     use crate::core::session::{
         PaneSession, SavedPaneSide, SessionState, TabSession, SESSION_VERSION,
@@ -3736,6 +3817,113 @@ mod clipboard_tests {
         assert!(!file_list_owns_keyboard_commands(true, false));
         assert!(!file_list_owns_keyboard_commands(false, true));
         assert!(!file_list_owns_keyboard_commands(true, true));
+    }
+
+    fn tab_cycle_event(
+        key: egui::Key,
+        physical_key: Option<egui::Key>,
+        repeat: bool,
+    ) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key,
+            pressed: true,
+            repeat,
+            modifiers: egui::Modifiers {
+                shift: true,
+                mac_cmd: true,
+                command: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn tab_cycle_wraps_in_both_directions() {
+        assert_eq!(cycle_tab_index(0, 4, TabCycleDirection::Previous), 3);
+        assert_eq!(cycle_tab_index(3, 4, TabCycleDirection::Next), 0);
+        assert_eq!(cycle_tab_index(2, 4, TabCycleDirection::Previous), 1);
+        assert_eq!(cycle_tab_index(1, 4, TabCycleDirection::Next), 2);
+    }
+
+    #[test]
+    fn tab_cycle_is_stable_with_zero_or_one_tab() {
+        assert_eq!(cycle_tab_index(0, 0, TabCycleDirection::Previous), 0);
+        assert_eq!(cycle_tab_index(0, 1, TabCycleDirection::Next), 0);
+    }
+
+    #[test]
+    fn tab_cycle_accepts_logical_curly_and_physical_bracket_keys() {
+        assert_eq!(
+            tab_cycle_key_event(&tab_cycle_event(
+                egui::Key::OpenCurlyBracket,
+                None,
+                false,
+            )),
+            Some((TabCycleDirection::Previous, false))
+        );
+        assert_eq!(
+            tab_cycle_key_event(&tab_cycle_event(
+                egui::Key::A,
+                Some(egui::Key::OpenBracket),
+                false,
+            )),
+            Some((TabCycleDirection::Previous, false))
+        );
+        assert_eq!(
+            tab_cycle_key_event(&tab_cycle_event(
+                egui::Key::CloseCurlyBracket,
+                None,
+                false,
+            )),
+            Some((TabCycleDirection::Next, false))
+        );
+        assert_eq!(
+            tab_cycle_key_event(&tab_cycle_event(
+                egui::Key::A,
+                Some(egui::Key::CloseBracket),
+                false,
+            )),
+            Some((TabCycleDirection::Next, false))
+        );
+    }
+
+    #[test]
+    fn tab_cycle_requires_command_and_shift() {
+        let mut event = tab_cycle_event(egui::Key::OpenCurlyBracket, None, false);
+        let egui::Event::Key { modifiers, .. } = &mut event else {
+            unreachable!();
+        };
+        modifiers.shift = false;
+
+        assert_eq!(tab_cycle_key_event(&event), None);
+    }
+
+    #[test]
+    fn tab_cycle_shortcut_is_consumed_before_terminal_input() {
+        let mut events = vec![
+            egui::Event::Text("unrelated".to_string()),
+            tab_cycle_event(egui::Key::CloseCurlyBracket, None, false),
+        ];
+
+        assert_eq!(
+            take_tab_cycle_shortcut(&mut events),
+            Some(TabCycleDirection::Next)
+        );
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], egui::Event::Text(text) if text == "unrelated"));
+    }
+
+    #[test]
+    fn repeated_tab_cycle_key_is_consumed_without_cycling() {
+        let mut events = vec![tab_cycle_event(
+            egui::Key::OpenCurlyBracket,
+            None,
+            true,
+        )];
+
+        assert_eq!(take_tab_cycle_shortcut(&mut events), None);
+        assert!(events.is_empty());
     }
 
     #[test]
