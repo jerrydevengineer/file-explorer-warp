@@ -1,8 +1,13 @@
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+
+use anyhow::Context;
 use portable_pty::{CommandBuilder, PtySize};
 use unicode_normalization::char::compose;
 use unicode_width::UnicodeWidthChar;
@@ -644,8 +649,7 @@ impl vte::Perform for TermPerformer<'_> {
                 // OSC 7: shell reports CWD as "file://hostname/path"
                 if let Some(url_bytes) = params.get(1) {
                     if let Ok(url) = std::str::from_utf8(url_bytes) {
-                        if let Some(path_str) = parse_osc7_path(url) {
-                            let new_path = PathBuf::from(path_str);
+                        if let Some(new_path) = parse_osc7_path(url) {
                             if self.grid.cwd.as_deref() != Some(&new_path) {
                                 self.grid.cwd = Some(new_path);
                                 self.grid.cwd_changed = true;
@@ -676,13 +680,47 @@ impl TermPerformer<'_> {
 
 // ── OSC 7 URL parser ──────────────────────────────────────────────────────────
 
-fn parse_osc7_path(url: &str) -> Option<&str> {
+fn parse_osc7_path(url: &str) -> Option<PathBuf> {
     // "file://hostname/path/to/dir"  →  "/path/to/dir"
     // "file:///path/to/dir"          →  "/path/to/dir"
     let without_scheme = url.strip_prefix("file://")?;
     // Skip hostname (everything up to the first '/')
     let path_start = without_scheme.find('/')?;
-    Some(&without_scheme[path_start..])
+    let encoded = without_scheme[path_start..].as_bytes();
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut index = 0;
+    while index < encoded.len() {
+        if encoded[index] == b'%' && index + 2 < encoded.len() {
+            if let (Some(high), Some(low)) = (
+                hex_value(encoded[index + 1]),
+                hex_value(encoded[index + 2]),
+            ) {
+                decoded.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(encoded[index]);
+        index += 1;
+    }
+
+    #[cfg(unix)]
+    {
+        Some(PathBuf::from(OsString::from_vec(decoded)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(decoded).ok().map(PathBuf::from)
+    }
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 // ── Terminal State (PTY + background thread) ──────────────────────────────────
@@ -701,23 +739,40 @@ impl TerminalState {
         notify: Arc<dyn Fn() + Send + Sync>,
     ) -> anyhow::Result<Self> {
         let pty_system = portable_pty::native_pty_system();
-        let pair = pty_system.openpty(PtySize {
-            cols: cols as u16,
-            rows: rows as u16,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
+        let pair = pty_system
+            .openpty(PtySize {
+                cols: cols as u16,
+                rows: rows as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("could not allocate pseudo-terminal")?;
 
         let mut cmd = CommandBuilder::new("zsh");
         cmd.cwd(cwd);
         // Tell zsh it's running inside our terminal
         cmd.env("TERM", "xterm-256color");
-        pair.slave.spawn_command(cmd)?;
+        // macOS installs its OSC 7 CWD-reporting hook from /etc/zshrc when
+        // TERM_PROGRAM identifies Terminal. We consume only that standard
+        // escape sequence; TERM_SESSION_ID remains unset, so Resume/session
+        // management is not enabled.
+        #[cfg(target_os = "macos")]
+        {
+            cmd.env("TERM_PROGRAM", "Apple_Terminal");
+            cmd.env_remove("TERM_SESSION_ID");
+            cmd.env_remove("SHELL_SESSION_ID");
+        }
+        pair.slave
+            .spawn_command(cmd)
+            .context("could not start zsh in pseudo-terminal")?;
 
         let grid = Arc::new(Mutex::new(TerminalGrid::new(cols, rows)));
 
         let grid_clone = grid.clone();
-        let mut reader = pair.master.try_clone_reader()?;
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .context("could not open pseudo-terminal reader")?;
         std::thread::spawn(move || {
             let mut parser = vte::Parser::new();
             let mut buf = [0u8; 4096];
@@ -737,7 +792,10 @@ impl TerminalState {
             }
         });
 
-        let writer = pair.master.take_writer()?;
+        let writer = pair
+            .master
+            .take_writer()
+            .context("could not open pseudo-terminal writer")?;
         Ok(Self { grid, writer, master: pair.master })
     }
 
@@ -760,7 +818,8 @@ impl TerminalState {
 
 #[cfg(test)]
 mod tests {
-    use super::{TermPerformer, TerminalGrid};
+    use super::{parse_osc7_path, TermPerformer, TerminalGrid};
+    use std::path::PathBuf;
 
     fn feed(grid: &mut TerminalGrid, text: &str) {
         let mut parser = vte::Parser::new();
@@ -782,6 +841,24 @@ mod tests {
                 assert_eq!(grid.cells[row][col + 1].width, 0);
             }
         }
+    }
+
+    #[test]
+    fn osc7_reports_and_drains_a_cwd_change() {
+        let mut grid = TerminalGrid::new(80, 24);
+
+        feed(&mut grid, "\x1b]7;file://localhost/tmp\x07");
+
+        assert_eq!(grid.take_cwd_update(), Some(PathBuf::from("/tmp")));
+        assert_eq!(grid.take_cwd_update(), None);
+    }
+
+    #[test]
+    fn osc7_decodes_spaces_apostrophes_and_utf8_paths() {
+        assert_eq!(
+            parse_osc7_path("file://localhost/tmp/Jerry%27s%20%ED%95%9C%EA%B8%80"),
+            Some(PathBuf::from("/tmp/Jerry's 한글")),
+        );
     }
 
     fn row_text(grid: &TerminalGrid, row: usize) -> String {

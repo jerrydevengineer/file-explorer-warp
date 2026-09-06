@@ -139,6 +139,18 @@ pub fn show(
     ui.horizontal(|ui| {
         ui.add_space(4.0);
 
+        // Keep New Tab before variable-width titles so it remains reachable
+        // even when a shell reports a very long title or many tabs are open.
+        if ui
+            .small_button("+")
+            .on_hover_text("New terminal tab (opens in current directory)")
+            .clicked()
+            && event.is_none()
+        {
+            event = Some(TerminalPanelEvent::NewTab);
+        }
+        ui.separator();
+
         // One button per tab; active tab is highlighted
         for (i, term) in terminals.iter().enumerate() {
             let title = {
@@ -165,13 +177,6 @@ pub fn show(
             }
 
             ui.add_space(2.0);
-        }
-
-        // New tab button
-        if ui.small_button("+").on_hover_text("New terminal tab (opens in current directory)").clicked()
-            && event.is_none()
-        {
-            event = Some(TerminalPanelEvent::NewTab);
         }
 
         // CWD of the active tab — shown after the tab list

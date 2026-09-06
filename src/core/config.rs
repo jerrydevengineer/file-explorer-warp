@@ -35,6 +35,8 @@ pub struct AppConfig {
     pub custom_theme: Option<String>,
     #[serde(default)]
     pub terminal: TerminalApp,
+    #[serde(default)]
+    pub terminal_cwd_sync: bool,
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
     #[serde(default = "default_git_panel_height")]
@@ -55,11 +57,43 @@ impl Default for AppConfig {
             theme: Theme::System,
             custom_theme: None,
             terminal: TerminalApp::Auto,
+            terminal_cwd_sync: false,
             sidebar_width: default_sidebar_width(),
             git_panel_height: default_git_panel_height(),
             git_panel_right: false,
             git_panel_width: default_git_panel_width(),
             terminal_panel_height: default_terminal_panel_height(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+
+    #[test]
+    fn old_config_defaults_terminal_cwd_sync_to_off() {
+        let config: AppConfig = serde_json::from_str(
+            r#"{
+                "show_hidden": false,
+                "last_path": null
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!config.terminal_cwd_sync);
+    }
+
+    #[test]
+    fn terminal_cwd_sync_round_trip_preserves_both_values() {
+        for enabled in [false, true] {
+            let mut config = AppConfig::default();
+            config.terminal_cwd_sync = enabled;
+
+            let encoded = serde_json::to_string(&config).unwrap();
+            let decoded: AppConfig = serde_json::from_str(&encoded).unwrap();
+
+            assert_eq!(decoded.terminal_cwd_sync, enabled);
         }
     }
 }

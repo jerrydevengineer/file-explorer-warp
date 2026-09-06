@@ -99,6 +99,18 @@ pub fn show(ctx: &egui::Context, open: &mut bool, config: &mut AppConfig, themes
                 }
             });
 
+            let was_cwd_sync = config.terminal_cwd_sync;
+            ui.checkbox(
+                &mut config.terminal_cwd_sync,
+                "Sync browser and integrated terminal folders",
+            )
+            .on_hover_text(
+                "When enabled, browser navigation changes the active terminal directory and terminal cd commands update the focused browser tab",
+            );
+            if config.terminal_cwd_sync != was_cwd_sync {
+                action.config_changed = true;
+            }
+
             ui.add_space(12.0);
 
             // ── Keyboard Shortcuts ───────────────────────────────────────────

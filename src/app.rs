@@ -517,6 +517,41 @@ fn file_list_owns_keyboard_commands(
     !wants_keyboard_input && !terminal_grid_has_focus
 }
 
+fn quoted_terminal_cd_command(path: &PathBuf) -> String {
+    let escaped = path.to_string_lossy().replace('\'', "'\\''");
+    format!("cd '{}'\r", escaped)
+}
+
+fn terminal_to_browser_sync_target(
+    sync_enabled: bool,
+    terminal_open: bool,
+    cwd_update: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if sync_enabled && terminal_open {
+        cwd_update
+    } else {
+        None
+    }
+}
+
+fn browser_to_terminal_sync_command(
+    sync_enabled: bool,
+    terminal_open: bool,
+    has_active_terminal: bool,
+    last_synced_path: Option<&PathBuf>,
+    current_path: &PathBuf,
+) -> Option<String> {
+    if sync_enabled
+        && terminal_open
+        && has_active_terminal
+        && last_synced_path != Some(current_path)
+    {
+        Some(quoted_terminal_cd_command(current_path))
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TabCycleDirection {
     Previous,
@@ -969,9 +1004,52 @@ impl App {
         }
     }
 
+    /// Drain every terminal's OSC 7 change flag. Only the active terminal's
+    /// newest path is eligible to drive browser navigation.
+    fn drain_terminal_cwd_updates(&mut self) -> Option<PathBuf> {
+        let mut active_update = None;
+        for (index, terminal) in self.terminals.iter().enumerate() {
+            let Some(update) = terminal
+                .grid
+                .lock()
+                .ok()
+                .and_then(|mut grid| grid.take_cwd_update())
+            else {
+                continue;
+            };
+            if index == self.terminal_active {
+                active_update = Some(update);
+            }
+        }
+        active_update
+    }
+
+    fn sync_browser_cwd_to_active_terminal(&mut self) {
+        let current_path = self.focused_pane().active().current_path.clone();
+        let command = browser_to_terminal_sync_command(
+            self.config.terminal_cwd_sync,
+            self.terminal_open,
+            self.terminals.get(self.terminal_active).is_some(),
+            self.terminal_last_sync_path.as_ref(),
+            &current_path,
+        );
+        if let Some(command) = command {
+            if let Some(terminal) = self.terminals.get_mut(self.terminal_active) {
+                terminal.write_input(command.as_bytes());
+                self.terminal_last_sync_path = Some(current_path);
+            }
+        }
+    }
+
+    fn reset_terminal_cwd_sync_tracking(&mut self) {
+        self.terminal_last_sync_path = None;
+        let _ = self.drain_terminal_cwd_updates();
+    }
+
     fn toggle_terminal(&mut self, ctx: &egui::Context) {
         if self.terminal_open {
             self.terminal_open = false;
+            self.reset_terminal_cwd_sync_tracking();
         } else {
             if self.terminals.is_empty() {
                 let cwd = self.focused_pane().active().current_path.clone();
@@ -988,6 +1066,7 @@ impl App {
             }
             self.terminal_open = true;
             self.terminal_last_sync_path = None;
+            self.sync_browser_cwd_to_active_terminal();
         }
     }
 
@@ -2209,36 +2288,30 @@ impl eframe::App for App {
             self.toggle_terminal(ctx);
         }
 
-        // ── Terminal CWD sync (terminal → browser) ────────────────────────────
-        let maybe_new_cwd: Option<PathBuf> = self
-            .terminals
-            .get(self.terminal_active)
-            .and_then(|t| t.grid.lock().ok())
-            .and_then(|mut g| g.take_cwd_update());
+        // ── Optional terminal CWD sync (terminal → browser) ───────────────────
+        // Drain OSC 7 updates even while sync is disabled or the panel is hidden,
+        // so a stale notification can never navigate the browser later.
+        let cwd_update = self.drain_terminal_cwd_updates();
+        let maybe_new_cwd = terminal_to_browser_sync_target(
+            self.config.terminal_cwd_sync,
+            self.terminal_open,
+            cwd_update,
+        );
         if let Some(new_cwd) = maybe_new_cwd {
-            if new_cwd.exists() {
+            if new_cwd.is_dir() {
                 let h = self.config.show_hidden;
-                self.focused_pane_mut()
+                let navigated = self
+                    .focused_pane_mut()
                     .active_mut()
                     .navigate(new_cwd.clone(), h);
-                self.terminal_last_sync_path = Some(new_cwd);
+                if navigated {
+                    self.terminal_last_sync_path = Some(new_cwd);
+                }
             }
         }
 
-        // ── Browser → terminal CWD sync ───────────────────────────────────────
-        if self.terminal_open && !self.terminals.is_empty() {
-            let current_path = self.focused_pane().active().current_path.clone();
-            let last = self.terminal_last_sync_path.clone();
-            if last.as_ref().map_or(false, |l| l != &current_path) {
-                if let Some(term) = self.terminals.get_mut(self.terminal_active) {
-                    let escaped = current_path.to_string_lossy().replace('\'', "'\\''");
-                    term.write_input(format!("cd '{}'\r", escaped).as_bytes());
-                }
-                self.terminal_last_sync_path = Some(current_path);
-            } else if last.is_none() {
-                self.terminal_last_sync_path = Some(current_path);
-            }
-        }
+        // ── Optional browser → terminal CWD sync ───────────────────────────────
+        self.sync_browser_cwd_to_active_terminal();
 
         if kb_open_search && !self.search_open {
             let root = self.focused_pane().active().current_path.clone();
@@ -2315,6 +2388,7 @@ impl eframe::App for App {
             let old_theme = self.config.theme;
             let old_custom_theme = self.config.custom_theme.clone();
             let old_hidden = self.config.show_hidden;
+            let old_terminal_cwd_sync = self.config.terminal_cwd_sync;
             let result = prefs::show(
                 ctx,
                 &mut self.prefs_open,
@@ -2338,6 +2412,13 @@ impl eframe::App for App {
                     self.left.reload_all(h);
                     if let Some(r) = &mut self.right {
                         r.reload_all(h);
+                    }
+                }
+                if self.config.terminal_cwd_sync != old_terminal_cwd_sync {
+                    // Clear stale OSC 7 flags in both transition directions.
+                    self.reset_terminal_cwd_sync_tracking();
+                    if self.config.terminal_cwd_sync {
+                        self.sync_browser_cwd_to_active_terminal();
                     }
                 }
                 self.config.save();
@@ -2498,33 +2579,54 @@ impl eframe::App for App {
                             opener::open_in_terminal(&cwd, terminal_app_pref);
                         }
                         Some(TerminalPanelEvent::NewTab) => {
+                            eprintln!("[terminal] new-tab requested");
                             let cwd = self.focused_pane().active().current_path.clone();
                             let ctx2 = ctx.clone();
-                            if let Ok(t) = TerminalState::spawn(
+                            match TerminalState::spawn(
                                 80,
                                 24,
                                 &cwd,
                                 Arc::new(move || ctx2.request_repaint()),
                             ) {
-                                self.terminals.push(t);
-                                self.terminal_active = self.terminals.len() - 1;
-                                self.terminal_last_sync_path = None;
+                                Ok(t) => {
+                                    self.terminals.push(t);
+                                    self.terminal_active = self.terminals.len() - 1;
+                                    if self.config.terminal_cwd_sync {
+                                        self.terminal_last_sync_path = None;
+                                    }
+                                    eprintln!(
+                                        "[terminal] spawn succeeded: count={} active={}",
+                                        self.terminals.len(),
+                                        self.terminal_active,
+                                    );
+                                }
+                                Err(error) => {
+                                    eprintln!("[terminal] spawn failed: {error:#}");
+                                    self.toasts.push(format!(
+                                        "Could not open a new terminal tab: {error}"
+                                    ));
+                                }
                             }
                         }
                         Some(TerminalPanelEvent::CloseTab(idx)) => {
                             self.terminals.remove(idx);
                             if self.terminals.is_empty() {
                                 self.terminal_open = false;
+                                self.terminal_last_sync_path = None;
                             } else {
                                 if self.terminal_active >= self.terminals.len() {
                                     self.terminal_active = self.terminals.len() - 1;
                                 }
-                                self.terminal_last_sync_path = None;
+                                if self.config.terminal_cwd_sync {
+                                    self.terminal_last_sync_path = None;
+                                }
                             }
                         }
                         Some(TerminalPanelEvent::SwitchTab(idx)) => {
                             self.terminal_active = idx;
-                            self.terminal_last_sync_path = None;
+                            if self.config.terminal_cwd_sync {
+                                self.terminal_last_sync_path = None;
+                            }
                         }
                         None => {}
                     }
@@ -3646,11 +3748,12 @@ fn apply_custom_theme(ctx: &egui::Context, colors: &crate::core::themes::ThemeCo
 #[cfg(test)]
 mod clipboard_tests {
     use super::{
-        browser_session_snapshot, classify_external_drag_operation, external_drag_source_dirs,
-        cycle_tab_index, file_list_owns_keyboard_commands, internal_drop_reload_dirs,
-        move_error_message, move_path, paste_paths, paste_reload_dirs, push_unique_path,
-        resolve_internal_file_drop, restore_browser_session, tab_cycle_key_event,
-        take_tab_cycle_shortcut, update_pending_session, ClipboardKind, ExternalDragResult,
+        browser_session_snapshot, browser_to_terminal_sync_command,
+        classify_external_drag_operation, cycle_tab_index, external_drag_source_dirs,
+        file_list_owns_keyboard_commands, internal_drop_reload_dirs, move_error_message, move_path,
+        paste_paths, paste_reload_dirs, push_unique_path, resolve_internal_file_drop,
+        restore_browser_session, tab_cycle_key_event, take_tab_cycle_shortcut,
+        terminal_to_browser_sync_target, update_pending_session, ClipboardKind, ExternalDragResult,
         FileDragState, InternalFileDrop, PaneSide, PaneState, TabCycleDirection, TabState,
         SESSION_SAVE_DEBOUNCE,
     };
@@ -4162,6 +4265,93 @@ mod clipboard_tests {
 
         assert_eq!(take_tab_cycle_shortcut(&mut events), None);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn disabled_terminal_sync_cannot_navigate_the_browser() {
+        let terminal_path = PathBuf::from("/tmp/from-terminal");
+
+        assert_eq!(
+            terminal_to_browser_sync_target(false, true, Some(terminal_path)),
+            None,
+        );
+    }
+
+    #[test]
+    fn hidden_terminal_cannot_navigate_the_browser() {
+        let terminal_path = PathBuf::from("/tmp/from-terminal");
+
+        assert_eq!(
+            terminal_to_browser_sync_target(true, false, Some(terminal_path)),
+            None,
+        );
+    }
+
+    #[test]
+    fn enabled_visible_terminal_can_navigate_the_browser() {
+        let terminal_path = PathBuf::from("/tmp/from-terminal");
+
+        assert_eq!(
+            terminal_to_browser_sync_target(true, true, Some(terminal_path.clone())),
+            Some(terminal_path),
+        );
+    }
+
+    #[test]
+    fn disabled_hidden_or_missing_terminal_never_receives_browser_cd() {
+        let current_path = PathBuf::from("/tmp/browser");
+
+        assert_eq!(
+            browser_to_terminal_sync_command(false, true, true, None, &current_path),
+            None,
+        );
+        assert_eq!(
+            browser_to_terminal_sync_command(true, false, true, None, &current_path),
+            None,
+        );
+        assert_eq!(
+            browser_to_terminal_sync_command(true, true, false, None, &current_path),
+            None,
+        );
+    }
+
+    #[test]
+    fn enabling_terminal_sync_sends_one_initial_shell_quoted_cd() {
+        let current_path = PathBuf::from("/tmp/Jerry's Folder");
+        let expected = "cd '/tmp/Jerry'\\''s Folder'\r";
+
+        assert_eq!(
+            browser_to_terminal_sync_command(true, true, true, None, &current_path).as_deref(),
+            Some(expected),
+        );
+        assert_eq!(
+            browser_to_terminal_sync_command(
+                true,
+                true,
+                true,
+                Some(&current_path),
+                &current_path,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn enabled_terminal_sync_tracks_a_changed_browser_directory() {
+        let old_path = PathBuf::from("/tmp/old");
+        let current_path = PathBuf::from("/tmp/new");
+
+        assert_eq!(
+            browser_to_terminal_sync_command(
+                true,
+                true,
+                true,
+                Some(&old_path),
+                &current_path,
+            )
+            .as_deref(),
+            Some("cd '/tmp/new'\r"),
+        );
     }
 
     #[test]

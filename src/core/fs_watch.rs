@@ -4,11 +4,12 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config, Event, EventKind, PollWatcher, RecursiveMode, Watcher};
 
 const QUIET_PERIOD: Duration = Duration::from_millis(160);
 const MAX_BATCH_LATENCY: Duration = Duration::from_millis(500);
 const WATCH_RETRY_DELAY: Duration = Duration::from_secs(5);
+const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Default)]
 struct RefreshDebouncer {
@@ -57,7 +58,7 @@ pub struct WatchUpdate {
 }
 
 pub struct DirectoryWatcher {
-    watcher: RecommendedWatcher,
+    watcher: PollWatcher,
     receiver: mpsc::Receiver<notify::Result<Event>>,
     watched_paths: HashSet<PathBuf>,
     failed_paths: HashMap<PathBuf, Instant>,
@@ -74,11 +75,14 @@ struct DirectoryIdentity {
 impl DirectoryWatcher {
     pub fn new(repaint: Arc<dyn Fn() + Send + Sync>) -> notify::Result<Self> {
         let (sender, receiver) = mpsc::channel();
-        let watcher = notify::recommended_watcher(move |result| {
-            if sender.send(result).is_ok() {
-                repaint();
-            }
-        })?;
+        let watcher = PollWatcher::new(
+            move |result| {
+                if sender.send(result).is_ok() {
+                    repaint();
+                }
+            },
+            Config::default().with_poll_interval(WATCH_POLL_INTERVAL),
+        )?;
         Ok(Self {
             watcher,
             receiver,
@@ -284,6 +288,15 @@ mod tests {
     use notify::{Event, EventKind};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_uses_polling_instead_of_the_descriptor_heavy_kqueue_backend() {
+        assert_eq!(
+            <notify::PollWatcher as notify::Watcher>::kind(),
+            notify::WatcherKind::PollWatcher,
+        );
+    }
 
     fn event(kind: EventKind, paths: &[&str]) -> Event {
         let mut event = Event::new(kind);
