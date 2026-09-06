@@ -190,7 +190,7 @@ pub fn show(
     global_tags: &crate::core::global_tags::GlobalTags,
     cut_paths: &[PathBuf],
     has_clipboard: bool,
-    dragging_paths: Option<&Vec<PathBuf>>,
+    dragging_paths: Option<&[PathBuf]>,
     tag_search_results: Option<&[std::path::PathBuf]>,
 ) -> Vec<FileListAction> {
     let mut actions = Vec::new();
@@ -706,11 +706,14 @@ pub fn show(
                     actions.push(FileListAction::DragStarted(state.selected.clone()));
                 }
 
-                // Drop dragged file onto a directory in the same pane
+                // A directory row is an exact drop target, regardless of which
+                // pane originated the app-level drag.
                 if is_dir_drop_target && pointer_released {
                     if let Some(from) = dragging_paths {
-                            actions
-                                .push(FileListAction::MoveItems(from.clone(), entry.path.clone()));
+                        actions.push(FileListAction::MoveItems(
+                            from.to_vec(),
+                            entry.path.clone(),
+                        ));
                     }
                 }
 

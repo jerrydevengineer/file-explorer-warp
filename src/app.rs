@@ -34,7 +34,6 @@ pub struct TabState {
     pub current_path: PathBuf,
     pub entries: Vec<FileEntry>,
     pub list_state: FileListState,
-    pub dragging_paths: Option<Vec<PathBuf>>,
     pub tag_filter: Option<String>,
     pub tag_search_results: Option<Vec<PathBuf>>,
     history: Vec<PathBuf>,
@@ -54,7 +53,6 @@ impl TabState {
             current_path: path.clone(),
             entries: Vec::new(),
             list_state: FileListState::default(),
-            dragging_paths: None,
             tag_filter: None,
             tag_search_results: None,
             history: vec![path],
@@ -190,11 +188,6 @@ impl TabState {
         if let Some(renaming) = &mut self.list_state.renaming {
             renaming.path = remap_path_prefix(&renaming.path, old_path, new_path);
         }
-        if let Some(paths) = &mut self.dragging_paths {
-            for path in paths {
-                *path = remap_path_prefix(path, old_path, new_path);
-            }
-        }
         self.reload_after_path_change(show_hidden);
         true
     }
@@ -210,7 +203,6 @@ impl TabState {
             *history_path = fallback.clone();
         }
         self.set_tag_view(None, None);
-        self.dragging_paths = None;
         let _ = self.reload(show_hidden);
         Some((old_path, fallback))
     }
@@ -600,7 +592,7 @@ fn take_tab_cycle_shortcut(events: &mut Vec<egui::Event>) -> Option<TabCycleDire
 
 // ── Focus / drag ──────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaneSide {
     Left,
     Right,
@@ -752,6 +744,62 @@ struct TabDrag {
     tab_idx: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileDragState {
+    paths: Vec<PathBuf>,
+    origin_pane: PaneSide,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InternalFileDrop {
+    paths: Vec<PathBuf>,
+    destination: PathBuf,
+}
+
+fn resolve_internal_file_drop(
+    explicit_target: Option<InternalFileDrop>,
+    drag: Option<&FileDragState>,
+    hovered_pane: Option<PaneSide>,
+    left_directory: &PathBuf,
+    right_directory: Option<&PathBuf>,
+) -> Option<InternalFileDrop> {
+    if explicit_target.is_some() {
+        return explicit_target;
+    }
+
+    let drag = drag?;
+    let destination = match (drag.origin_pane, hovered_pane) {
+        (PaneSide::Right, Some(PaneSide::Left)) => left_directory.clone(),
+        (PaneSide::Left, Some(PaneSide::Right)) => right_directory?.clone(),
+        _ => return None,
+    };
+    Some(InternalFileDrop {
+        paths: drag.paths.clone(),
+        destination,
+    })
+}
+
+fn internal_drop_reload_dirs(paths: &[PathBuf], destination: &PathBuf) -> Vec<PathBuf> {
+    let mut directories = vec![destination.clone()];
+    for path in paths {
+        if let Some(parent) = path.parent() {
+            push_unique_path(&mut directories, parent.to_path_buf());
+        }
+    }
+    directories
+}
+
+#[derive(Default)]
+struct FileActionOutcome {
+    navigate_to: Option<PathBuf>,
+    changed_dirs: Vec<PathBuf>,
+    quicklook_path: Option<PathBuf>,
+    select_after_nav: Option<PathBuf>,
+    clear_tag_filter: bool,
+    drag_started: Option<Vec<PathBuf>>,
+    internal_drop: Option<InternalFileDrop>,
+}
+
 // ── Root app ──────────────────────────────────────────────────────────────────
 
 pub struct App {
@@ -767,6 +815,7 @@ pub struct App {
     right: Option<PaneState>,
     focus: PaneSide,
     tab_drag: Option<TabDrag>,
+    file_drag: Option<FileDragState>,
     /// Fraction of content width taken by the left pane (0.15–0.85).
     split_ratio: f32,
     /// Content rect from last frame — used for tab-drag drop-zone detection.
@@ -866,6 +915,7 @@ impl App {
             right: restored.right,
             focus: restored.focus,
             tab_drag: None,
+            file_drag: None,
             split_ratio: restored.split_ratio,
             content_rect: egui::Rect::EVERYTHING,
             config,
@@ -1011,28 +1061,17 @@ impl App {
         bookmarks: &mut Bookmarks,
         toasts: &mut Toasts,
         terminal: crate::core::config::TerminalApp,
-        dragging_paths: &mut Option<Vec<PathBuf>>,
-    ) -> (
-        Option<PathBuf>,
-        Vec<PathBuf>,
-        Option<PathBuf>,
-        Option<PathBuf>,
-        bool,
-    ) {
-        let mut navigate_to: Option<PathBuf> = None;
-        let mut changed_dirs = Vec::new();
-        let mut quicklook_path: Option<PathBuf> = None;
-        let mut select_after_nav: Option<PathBuf> = None;
-        let mut clear_tag_filter = false;
+    ) -> FileActionOutcome {
+        let mut outcome = FileActionOutcome::default();
         for action in actions {
             match action {
-                FileListAction::Navigate(path) => navigate_to = Some(path),
+                FileListAction::Navigate(path) => outcome.navigate_to = Some(path),
                 FileListAction::NavigateAndSelect(dir, file) => {
-                    navigate_to = Some(dir);
-                    select_after_nav = Some(file);
+                    outcome.navigate_to = Some(dir);
+                    outcome.select_after_nav = Some(file);
                 }
                 FileListAction::ClearTagFilter => {
-                    clear_tag_filter = true;
+                    outcome.clear_tag_filter = true;
                 }
                 FileListAction::OpenFile(path) => opener::open_file(&path),
                 FileListAction::CopyPath(path) => {
@@ -1045,9 +1084,9 @@ impl App {
                 FileListAction::RevealInFinder(path) => opener::reveal_in_finder(&path),
                 FileListAction::OpenInTerminal(path) => opener::open_in_terminal(&path, terminal),
                 FileListAction::DragStarted(paths) => {
-                    *dragging_paths = Some(paths);
+                    outcome.drag_started = Some(paths);
                 }
-                FileListAction::QuickLook(path) => quicklook_path = Some(path),
+                FileListAction::QuickLook(path) => outcome.quicklook_path = Some(path),
                 FileListAction::Share(path) => share::show_share_sheet(&path),
                 FileListAction::GetInfo(path) => opener::get_info(&path),
                 FileListAction::StartCreating(_) | FileListAction::CreateItem(_, _) => {}
@@ -1062,7 +1101,10 @@ impl App {
                             Ok(_) => {
                                 toasts.push(format!("Moved to Trash: {}", name));
                                 if let Some(parent) = path.parent() {
-                                    push_unique_path(&mut changed_dirs, parent.to_path_buf());
+                                    push_unique_path(
+                                        &mut outcome.changed_dirs,
+                                        parent.to_path_buf(),
+                                    );
                                 }
                             }
                             Err(e) => {
@@ -1076,23 +1118,17 @@ impl App {
                     }
                 }
                 FileListAction::MoveItems(paths, to_dir) => {
-                    for from in paths {
-                        if let Some(parent) = from.parent() {
-                            push_unique_path(&mut changed_dirs, parent.to_path_buf());
-                        }
-                        push_unique_path(&mut changed_dirs, to_dir.clone());
-                        match move_path(&from, &to_dir) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                toasts.push(move_error_message(&from, &e));
-                            }
-                        }
+                    if outcome.internal_drop.is_none() {
+                        outcome.internal_drop = Some(InternalFileDrop {
+                            paths,
+                            destination: to_dir,
+                        });
                     }
                 }
                 FileListAction::SetTags(path, new_tags) => {
                     crate::core::tags::write_tags(&path, &new_tags);
                     if let Some(parent) = path.parent() {
-                        push_unique_path(&mut changed_dirs, parent.to_path_buf());
+                        push_unique_path(&mut outcome.changed_dirs, parent.to_path_buf());
                     }
                     let file_name = display_text::file_name(&path);
                     if new_tags.is_empty() {
@@ -1104,13 +1140,7 @@ impl App {
                 }
             }
         }
-        (
-            navigate_to,
-            changed_dirs,
-            quicklook_path,
-            select_after_nav,
-            clear_tag_filter,
-        )
+        outcome
     }
 
     fn handle_creating_actions(
@@ -1369,6 +1399,19 @@ impl App {
         }
     }
 
+    fn perform_internal_file_drop(&mut self, drop: InternalFileDrop) {
+        let changed_dirs = internal_drop_reload_dirs(&drop.paths, &drop.destination);
+        for source in drop.paths {
+            match move_path(&source, &drop.destination) {
+                Ok(_) => self
+                    .toasts
+                    .push(format!("Moved: {}", display_text::file_name(&source))),
+                Err(error) => self.toasts.push(move_error_message(&source, &error)),
+            }
+        }
+        self.reload_tabs_in_dirs(&changed_dirs);
+    }
+
     fn displayed_directories(&self) -> Vec<PathBuf> {
         let mut directories = Vec::new();
         for tab in &self.left.tabs {
@@ -1388,6 +1431,11 @@ impl App {
         }
         let show_hidden = self.config.show_hidden;
         for (old_path, new_path) in renames {
+            if let Some(drag) = &mut self.file_drag {
+                for path in &mut drag.paths {
+                    *path = remap_path_prefix(path, old_path, new_path);
+                }
+            }
             let mut followed = false;
             for tab in &mut self.left.tabs {
                 followed |= tab.follow_external_directory_rename(old_path, new_path, show_hidden);
@@ -1715,6 +1763,20 @@ impl eframe::App for App {
         self.process_directory_watcher(ctx);
         let pointer_released = ctx.input(|i| i.pointer.any_released());
 
+        let missing_drag_paths = self.file_drag.as_ref().map_or(0, |drag| {
+            drag.paths.iter().filter(|path| !path.exists()).count()
+        });
+        if missing_drag_paths > 0 {
+            self.toasts.push(format!(
+                "Cancelled drag because {} source item{} no longer exist{}",
+                missing_drag_paths,
+                if missing_drag_paths == 1 { "" } else { "s" },
+                if missing_drag_paths == 1 { "s" } else { "" },
+            ));
+            crate::platform::drag::cancel_pending_external_drag();
+            self.file_drag = None;
+        }
+
         // ── External drag-end reload ──────────────────────────────────────────
         #[cfg(target_os = "macos")]
         {
@@ -1773,20 +1835,13 @@ impl eframe::App for App {
 
         // ── File drag ghost ───────────────────────────────────────────────────
         let file_dragging_name = self
-            .left
-            .active()
-            .dragging_paths
+            .file_drag
             .as_ref()
-            .or_else(|| {
-                self.right
-                    .as_ref()
-                    .and_then(|r| r.active().dragging_paths.as_ref())
-            })
-            .map(|paths| {
-                if paths.len() == 1 {
-                    display_text::file_name(&paths[0])
-            } else {
-                format!("{} items", paths.len())
+            .map(|drag| {
+                if drag.paths.len() == 1 {
+                    display_text::file_name(&drag.paths[0])
+                } else {
+                    format!("{} items", drag.paths.len())
                 }
             });
 
@@ -2477,11 +2532,10 @@ impl eframe::App for App {
         }
 
         // ── Central panel — sidebar + manual split ───────────────────────────
-        let file_dragging_paths = self.left.active().dragging_paths.clone().or_else(|| {
-            self.right
-                .as_ref()
-                .and_then(|r| r.active().dragging_paths.clone())
-        });
+        let file_dragging_paths = self.file_drag.as_ref().map(|drag| drag.paths.clone());
+        let mut pending_internal_drop: Option<InternalFileDrop> = None;
+        let mut rendered_left_rect: Option<egui::Rect> = None;
+        let mut rendered_right_rect: Option<egui::Rect> = None;
         let current_path_for_sidebar = self.focused_pane().active().current_path.clone();
         let active_tag = self.focused_pane().active().tag_filter.clone();
         if self
@@ -2546,7 +2600,7 @@ impl eframe::App for App {
                             &mut self.bookmarks,
                             &self.global_tags,
                             &current_path_for_sidebar,
-                            &file_dragging_paths,
+                            file_dragging_paths.as_deref(),
                             active_tag.as_deref(),
                             &mut self.new_tag_input,
                             &mut self.new_tag_color,
@@ -2559,25 +2613,12 @@ impl eframe::App for App {
                                 SidebarAction::OpenFile(p) => opener::open_file(&p),
                                 SidebarAction::AddBookmark(p) => sidebar_bookmark = Some(p),
                                 SidebarAction::MoveFilesTo(paths, to_dir) => {
-                                    let mut changed_dirs = vec![to_dir.clone()];
-                                    for from in paths {
-                                        if let Some(parent) = from.parent() {
-                                                push_unique_path(
-                                                    &mut changed_dirs,
-                                                    parent.to_path_buf(),
-                                                );
-                                        }
-                                        match move_path(&from, &to_dir) {
-                                                Ok(_) => self.toasts.push(format!(
-                                                    "Moved: {}",
-                                                    display_text::file_name(&from)
-                                                )),
-                                                Err(e) => {
-                                                    self.toasts.push(move_error_message(&from, &e))
-                                                }
-                                        }
+                                    if pending_internal_drop.is_none() {
+                                        pending_internal_drop = Some(InternalFileDrop {
+                                            paths,
+                                            destination: to_dir,
+                                        });
                                     }
-                                    self.reload_tabs_in_dirs(&changed_dirs);
                                 }
                                 SidebarAction::FilterTag(tag) => {
                                     let tab = self.focused_pane_mut().active_mut();
@@ -2736,6 +2777,8 @@ impl eframe::App for App {
                     egui::pos2(div_x + half + gap, full_rect.min.y),
                     full_rect.max,
                 );
+                rendered_left_rect = Some(left_rect);
+                rendered_right_rect = Some(right_rect);
 
                 let div_id = ui.id().with("split_divider");
                 let div_resp = ui.interact(div_rect, div_id, egui::Sense::drag());
@@ -2774,6 +2817,7 @@ impl eframe::App for App {
                     &self.global_tags,
                     &cut_paths,
                     has_clipboard,
+                    file_dragging_paths.as_deref(),
                 );
 
                 for action in left_tab_actions {
@@ -2823,14 +2867,21 @@ impl eframe::App for App {
                                 | FileListAction::RenameItem(_, _)
                         )
                     });
-                let (left_nav, mut left_changed_dirs, left_ql, left_sel_nav, left_clear_tag) =
-                    Self::handle_file_actions(
+                let mut left_outcome = Self::handle_file_actions(
                     left_regular,
                     &mut self.bookmarks,
                     &mut self.toasts,
                     terminal,
-                    &mut self.left.tabs[self.left.active_tab].dragging_paths,
                 );
+                if let Some(paths) = left_outcome.drag_started.take() {
+                    self.file_drag = Some(FileDragState {
+                        paths,
+                        origin_pane: PaneSide::Left,
+                    });
+                }
+                if pending_internal_drop.is_none() {
+                    pending_internal_drop = left_outcome.internal_drop.take();
+                }
                 let (left_create_changed_dirs, left_create_sel) = Self::handle_creating_actions(
                     left_creating,
                     &mut self.left.tabs[left_ai],
@@ -2844,9 +2895,9 @@ impl eframe::App for App {
                     &mut self.toasts,
                 );
                 for dir in left_create_changed_dirs {
-                    push_unique_path(&mut left_changed_dirs, dir);
+                    push_unique_path(&mut left_outcome.changed_dirs, dir);
                 }
-                self.reload_tabs_in_dirs(&left_changed_dirs);
+                self.reload_tabs_in_dirs(&left_outcome.changed_dirs);
                 if let Some(p) = left_create_sel {
                     self.left.tabs[left_ai].list_state.select_only(p);
                 }
@@ -2862,19 +2913,19 @@ impl eframe::App for App {
                         .list_state
                         .select_all(left_created.iter());
                 }
-                if let Some(p) = left_nav {
+                if let Some(p) = left_outcome.navigate_to {
                     let h = self.config.show_hidden;
                     self.left.tabs[self.left.active_tab].navigate(p.clone(), h);
-                    if let Some(sel) = left_sel_nav {
+                    if let Some(sel) = left_outcome.select_after_nav {
                         self.left.tabs[left_ai].list_state.select_only(sel);
                     }
                     self.config.last_path = Some(p);
                     self.config.save();
                 }
-                if left_clear_tag {
+                if left_outcome.clear_tag_filter {
                     self.left.tabs[left_ai].set_tag_view(None, None);
                 }
-                if let Some(p) = left_ql {
+                if let Some(p) = left_outcome.quicklook_path {
                     self.do_quicklook(p);
                 }
                 if left_focus_clicked {
@@ -2903,6 +2954,7 @@ impl eframe::App for App {
                         &self.global_tags,
                         &cut_paths,
                         has_clipboard,
+                        file_dragging_paths.as_deref(),
                     )
                 };
 
@@ -2956,14 +3008,21 @@ impl eframe::App for App {
                                 | FileListAction::RenameItem(_, _)
                         )
                     });
-                let (right_nav, mut right_changed_dirs, right_ql, right_sel_nav, right_clear_tag) =
-                    Self::handle_file_actions(
+                let mut right_outcome = Self::handle_file_actions(
                     right_regular,
                     &mut self.bookmarks,
                     &mut self.toasts,
                     terminal,
-                    &mut self.right.as_mut().unwrap().tabs[right_ai].dragging_paths,
                 );
+                if let Some(paths) = right_outcome.drag_started.take() {
+                    self.file_drag = Some(FileDragState {
+                        paths,
+                        origin_pane: PaneSide::Right,
+                    });
+                }
+                if pending_internal_drop.is_none() {
+                    pending_internal_drop = right_outcome.internal_drop.take();
+                }
                 let (right_create_changed_dirs, right_create_sel) = Self::handle_creating_actions(
                     right_creating,
                     self.right.as_mut().unwrap().tabs.get_mut(right_ai).unwrap(),
@@ -2981,9 +3040,9 @@ impl eframe::App for App {
                     &mut self.toasts,
                 );
                 for dir in right_create_changed_dirs {
-                    push_unique_path(&mut right_changed_dirs, dir);
+                    push_unique_path(&mut right_outcome.changed_dirs, dir);
                 }
-                self.reload_tabs_in_dirs(&right_changed_dirs);
+                self.reload_tabs_in_dirs(&right_outcome.changed_dirs);
                 if let (Some(r), Some(p)) = (&mut self.right, right_create_sel) {
                     r.tabs[right_ai].list_state.select_only(p);
                 }
@@ -2999,21 +3058,21 @@ impl eframe::App for App {
                         r.tabs[right_ai].list_state.select_all(right_created.iter());
                     }
                 }
-                if let Some(p) = right_nav {
+                if let Some(p) = right_outcome.navigate_to {
                     let h = self.config.show_hidden;
                     if let Some(r) = &mut self.right {
                         r.tabs[right_ai].navigate(p, h);
-                        if let Some(sel) = right_sel_nav {
+                        if let Some(sel) = right_outcome.select_after_nav {
                             r.tabs[right_ai].list_state.select_only(sel);
                         }
                     }
                 }
-                if right_clear_tag {
+                if right_outcome.clear_tag_filter {
                     if let Some(r) = &mut self.right {
                         r.tabs[right_ai].set_tag_view(None, None);
                     }
                 }
-                if let Some(p) = right_ql {
+                if let Some(p) = right_outcome.quicklook_path {
                     self.do_quicklook(p);
                 }
                 if right_focus_clicked {
@@ -3025,6 +3084,8 @@ impl eframe::App for App {
                 }
             } else {
                 // ── Only left pane (full rect) ────────────────────────────────
+                rendered_left_rect = Some(full_rect);
+                rendered_right_rect = None;
                 let left_drop_target = is_tab_dragging; // can only drag from left, so never true
 
                 // Draw drop zone overlay on right half when dragging a tab
@@ -3065,6 +3126,7 @@ impl eframe::App for App {
                     &self.global_tags,
                     &cut_paths,
                     has_clipboard,
+                    file_dragging_paths.as_deref(),
                 );
 
                 for action in left_tab_actions {
@@ -3112,14 +3174,21 @@ impl eframe::App for App {
                                 | FileListAction::RenameItem(_, _)
                         )
                     });
-                let (left_nav, mut left_changed_dirs, left_ql, left_sel_nav, left_clear_tag) =
-                    Self::handle_file_actions(
+                let mut left_outcome = Self::handle_file_actions(
                     left_regular,
                     &mut self.bookmarks,
                     &mut self.toasts,
                     terminal,
-                    &mut self.left.tabs[left_ai].dragging_paths,
                 );
+                if let Some(paths) = left_outcome.drag_started.take() {
+                    self.file_drag = Some(FileDragState {
+                        paths,
+                        origin_pane: PaneSide::Left,
+                    });
+                }
+                if pending_internal_drop.is_none() {
+                    pending_internal_drop = left_outcome.internal_drop.take();
+                }
                 let (left_create_changed_dirs, left_create_sel) = Self::handle_creating_actions(
                     left_creating,
                     &mut self.left.tabs[left_ai],
@@ -3133,9 +3202,9 @@ impl eframe::App for App {
                     &mut self.toasts,
                 );
                 for dir in left_create_changed_dirs {
-                    push_unique_path(&mut left_changed_dirs, dir);
+                    push_unique_path(&mut left_outcome.changed_dirs, dir);
                 }
-                self.reload_tabs_in_dirs(&left_changed_dirs);
+                self.reload_tabs_in_dirs(&left_outcome.changed_dirs);
                 if let Some(p) = left_create_sel {
                     self.left.tabs[left_ai].list_state.select_only(p);
                 }
@@ -3151,19 +3220,19 @@ impl eframe::App for App {
                         .list_state
                         .select_all(left_created.iter());
                 }
-                if let Some(p) = left_nav {
+                if let Some(p) = left_outcome.navigate_to {
                     let h = self.config.show_hidden;
                     self.left.tabs[left_ai].navigate(p.clone(), h);
-                    if let Some(sel) = left_sel_nav {
+                    if let Some(sel) = left_outcome.select_after_nav {
                         self.left.tabs[left_ai].list_state.select_only(sel);
                     }
                     self.config.last_path = Some(p);
                     self.config.save();
                 }
-                if left_clear_tag {
+                if left_outcome.clear_tag_filter {
                     self.left.tabs[left_ai].set_tag_view(None, None);
                 }
-                if let Some(p) = left_ql {
+                if let Some(p) = left_outcome.quicklook_path {
                     self.do_quicklook(p);
                 }
             }
@@ -3223,60 +3292,41 @@ impl eframe::App for App {
             }
         }
 
-        // ── Cross-pane drag-to-move ───────────────────────────────────────────
-        let mut cross_pane_move: Option<(Vec<PathBuf>, PathBuf)> = None;
-        if pointer_released {
-            if self.right.is_some() {
-                if let Some(pos) = ctx.pointer_hover_pos() {
-                    let half: f32 = 3.0;
-                    let gap: f32 = 6.0;
-                    let div_x =
-                        self.content_rect.left() + self.content_rect.width() * self.split_ratio;
-                    let right_x = div_x + half + gap;
-                    let left_x = div_x - half - gap;
-
-                    if let Some(from) = self.left.active().dragging_paths.clone() {
-                        if pos.x > right_x {
-                            let to_dir = self.right.as_ref().unwrap().active().current_path.clone();
-                            cross_pane_move = Some((from, to_dir));
-                        }
-                    }
-                    if cross_pane_move.is_none() {
-                        if let Some(from) =
-                            self.right.as_ref().unwrap().active().dragging_paths.clone()
-                        {
-                            if pos.x < left_x {
-                                let to_dir = self.left.active().current_path.clone();
-                                cross_pane_move = Some((from, to_dir));
-                            }
-                        }
-                    }
+        // ── Resolve one internal drop ─────────────────────────────────────────
+        let hovered_pane = if pointer_released {
+            ctx.pointer_hover_pos().and_then(|position| {
+                if rendered_left_rect.is_some_and(|rect| rect.contains(position)) {
+                    Some(PaneSide::Left)
+                } else if rendered_right_rect.is_some_and(|rect| rect.contains(position)) {
+                    Some(PaneSide::Right)
+                } else {
+                    None
                 }
-            }
-        }
-        if let Some((paths, to_dir)) = cross_pane_move {
-            let mut changed_dirs = vec![to_dir.clone()];
-            for from in paths {
-                if let Some(parent) = from.parent() {
-                    push_unique_path(&mut changed_dirs, parent.to_path_buf());
-                }
-                match move_path(&from, &to_dir) {
-                    Ok(_) => self
-                        .toasts
-                        .push(format!("Moved: {}", display_text::file_name(&from))),
-                    Err(e) => self.toasts.push(move_error_message(&from, &e)),
-                }
-            }
-            self.reload_tabs_in_dirs(&changed_dirs);
+            })
+        } else {
+            None
+        };
+        let left_directory = self.left.active().current_path.clone();
+        let right_directory = self
+            .right
+            .as_ref()
+            .map(|right| right.active().current_path.clone());
+        let internal_drop = resolve_internal_file_drop(
+            pending_internal_drop,
+            self.file_drag.as_ref(),
+            hovered_pane,
+            &left_directory,
+            right_directory.as_ref(),
+        );
+        if let Some(drop) = internal_drop {
+            // Clear before moving so this release cannot also begin a native drag.
+            self.file_drag.take();
+            self.perform_internal_file_drop(drop);
         }
 
         // ── External drag: trigger when cursor leaves the window ──────────────
         #[cfg(target_os = "macos")]
-        if let Some(dragging_paths) = self.left.active().dragging_paths.clone().or_else(|| {
-            self.right
-                .as_ref()
-                .and_then(|r| r.active().dragging_paths.clone())
-        }) {
+        if self.file_drag.is_some() {
             let window_rect = ctx.screen_rect();
             let cursor_left = ctx.input(|i| {
                 i.pointer
@@ -3284,22 +3334,9 @@ impl eframe::App for App {
                     .map_or(false, |p| !window_rect.contains(p))
             });
             if cursor_left {
-                let existing_paths: Vec<PathBuf> = dragging_paths
-                    .iter()
-                    .filter(|path| path.exists())
-                    .cloned()
-                    .collect();
-                let missing_count = dragging_paths.len() - existing_paths.len();
-                if missing_count > 0 {
-                    self.toasts.push(format!(
-                        "Skipped {} dragged item{} that no longer exist{}",
-                        missing_count,
-                        if missing_count == 1 { "" } else { "s" },
-                        if missing_count == 1 { "s" } else { "" },
-                    ));
-                }
+                let drag = self.file_drag.take().unwrap();
                 let path_refs: Vec<&std::path::Path> =
-                    existing_paths.iter().map(PathBuf::as_path).collect();
+                    drag.paths.iter().map(PathBuf::as_path).collect();
                 let gesture_id = self.next_external_drag_gesture_id;
                 self.next_external_drag_gesture_id = gesture_id.wrapping_add(1).max(1);
                 match crate::platform::drag::begin_external_drag(&path_refs, gesture_id) {
@@ -3307,10 +3344,6 @@ impl eframe::App for App {
                     Err(error) => self
                         .toasts
                         .push(format!("Could not start external drag: {}", error)),
-                }
-                self.left.active_mut().dragging_paths = None;
-                if let Some(r) = &mut self.right {
-                    r.active_mut().dragging_paths = None;
                 }
             }
         }
@@ -3343,10 +3376,7 @@ impl eframe::App for App {
         // ── Clear file drag state ─────────────────────────────────────────────
         if pointer_released {
             crate::platform::drag::cancel_pending_external_drag();
-            self.left.active_mut().dragging_paths = None;
-            if let Some(r) = &mut self.right {
-                r.active_mut().dragging_paths = None;
-            }
+            self.file_drag.take();
         }
 
         self.process_session_persistence(ctx);
@@ -3386,6 +3416,7 @@ fn render_pane(
     global_tags: &crate::core::global_tags::GlobalTags,
     cut_paths: &[PathBuf],
     has_clipboard: bool,
+    dragging_paths: Option<&[PathBuf]>,
 ) -> (Vec<tab_bar::TabBarAction>, Vec<FileListAction>, bool) {
     let mut tab_actions = Vec::new();
     let mut file_actions = Vec::new();
@@ -3458,7 +3489,7 @@ fn render_pane(
                         global_tags,
                         cut_paths,
                         has_clipboard,
-                        t.dragging_paths.as_ref(),
+                        dragging_paths,
                         t.tag_search_results.as_deref(),
                     )
                 };
@@ -3616,10 +3647,11 @@ fn apply_custom_theme(ctx: &egui::Context, colors: &crate::core::themes::ThemeCo
 mod clipboard_tests {
     use super::{
         browser_session_snapshot, classify_external_drag_operation, external_drag_source_dirs,
-        cycle_tab_index, file_list_owns_keyboard_commands, move_error_message, move_path,
-        paste_paths, paste_reload_dirs, push_unique_path, restore_browser_session,
-        tab_cycle_key_event, take_tab_cycle_shortcut, update_pending_session, ClipboardKind,
-        ExternalDragResult, PaneSide, PaneState, TabCycleDirection, TabState,
+        cycle_tab_index, file_list_owns_keyboard_commands, internal_drop_reload_dirs,
+        move_error_message, move_path, paste_paths, paste_reload_dirs, push_unique_path,
+        resolve_internal_file_drop, restore_browser_session, tab_cycle_key_event,
+        take_tab_cycle_shortcut, update_pending_session, ClipboardKind, ExternalDragResult,
+        FileDragState, InternalFileDrop, PaneSide, PaneState, TabCycleDirection, TabState,
         SESSION_SAVE_DEBOUNCE,
     };
     use crate::core::session::{
@@ -3808,6 +3840,212 @@ mod clipboard_tests {
         assert_eq!(
             external_drag_source_dirs(&paths),
             vec![PathBuf::from("/one"), PathBuf::from("/two")],
+        );
+    }
+
+    fn left_file_drag(paths: Vec<PathBuf>) -> FileDragState {
+        FileDragState {
+            paths,
+            origin_pane: PaneSide::Left,
+        }
+    }
+
+    #[test]
+    fn hovered_folder_wins_over_opposite_pane_root() {
+        let drag = left_file_drag(vec![PathBuf::from("/left/item.txt")]);
+        let folder_drop = InternalFileDrop {
+            paths: drag.paths.clone(),
+            destination: PathBuf::from("/right/exact-folder"),
+        };
+
+        let resolved = resolve_internal_file_drop(
+            Some(folder_drop.clone()),
+            Some(&drag),
+            Some(PaneSide::Right),
+            &PathBuf::from("/left"),
+            Some(&PathBuf::from("/right")),
+        );
+
+        assert_eq!(resolved, Some(folder_drop));
+    }
+
+    #[test]
+    fn sidebar_target_wins_over_pane_root_fallback() {
+        let drag = left_file_drag(vec![PathBuf::from("/left/item.txt")]);
+        let sidebar_drop = InternalFileDrop {
+            paths: drag.paths.clone(),
+            destination: PathBuf::from("/bookmarks/project"),
+        };
+
+        let resolved = resolve_internal_file_drop(
+            Some(sidebar_drop.clone()),
+            Some(&drag),
+            Some(PaneSide::Right),
+            &PathBuf::from("/left"),
+            Some(&PathBuf::from("/right")),
+        );
+
+        assert_eq!(resolved, Some(sidebar_drop));
+    }
+
+    #[test]
+    fn opposite_pane_empty_space_uses_its_active_directory() {
+        let drag = left_file_drag(vec![PathBuf::from("/left/item.txt")]);
+
+        let resolved = resolve_internal_file_drop(
+            None,
+            Some(&drag),
+            Some(PaneSide::Right),
+            &PathBuf::from("/left"),
+            Some(&PathBuf::from("/right/active-tab")),
+        );
+
+        assert_eq!(
+            resolved,
+            Some(InternalFileDrop {
+                paths: drag.paths,
+                destination: PathBuf::from("/right/active-tab"),
+            })
+        );
+    }
+
+    #[test]
+    fn opposite_pane_fallback_also_works_right_to_left() {
+        let drag = FileDragState {
+            paths: vec![PathBuf::from("/right/item.txt")],
+            origin_pane: PaneSide::Right,
+        };
+
+        let resolved = resolve_internal_file_drop(
+            None,
+            Some(&drag),
+            Some(PaneSide::Left),
+            &PathBuf::from("/left/active-tab"),
+            Some(&PathBuf::from("/right")),
+        );
+
+        assert_eq!(
+            resolved,
+            Some(InternalFileDrop {
+                paths: drag.paths,
+                destination: PathBuf::from("/left/active-tab"),
+            })
+        );
+    }
+
+    #[test]
+    fn origin_pane_empty_space_does_not_move_files() {
+        let drag = left_file_drag(vec![PathBuf::from("/left/item.txt")]);
+
+        let resolved = resolve_internal_file_drop(
+            None,
+            Some(&drag),
+            Some(PaneSide::Left),
+            &PathBuf::from("/left"),
+            Some(&PathBuf::from("/right")),
+        );
+
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn app_level_drag_uses_the_destination_tab_active_at_release() {
+        let drag = left_file_drag(vec![PathBuf::from("/left/item.txt")]);
+        let newly_active_destination = PathBuf::from("/right/second-tab");
+
+        let resolved = resolve_internal_file_drop(
+            None,
+            Some(&drag),
+            Some(PaneSide::Right),
+            &PathBuf::from("/left"),
+            Some(&newly_active_destination),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.paths, drag.paths);
+        assert_eq!(resolved.destination, newly_active_destination);
+    }
+
+    #[test]
+    fn multi_selection_payload_and_all_changed_directories_are_preserved() {
+        let paths = vec![
+            PathBuf::from("/source-one/a.txt"),
+            PathBuf::from("/source-one/b.txt"),
+            PathBuf::from("/source-two/c.txt"),
+        ];
+        let drag = left_file_drag(paths.clone());
+        let destination = PathBuf::from("/destination/exact-folder");
+        let resolved = resolve_internal_file_drop(
+            None,
+            Some(&drag),
+            Some(PaneSide::Right),
+            &PathBuf::from("/left"),
+            Some(&destination),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.paths, paths);
+        assert_eq!(
+            internal_drop_reload_dirs(&resolved.paths, &resolved.destination),
+            vec![
+                destination,
+                PathBuf::from("/source-one"),
+                PathBuf::from("/source-two"),
+            ]
+        );
+    }
+
+    #[test]
+    fn drag_started_is_returned_without_being_attached_to_a_tab() {
+        let paths = vec![
+            PathBuf::from("/source/a.txt"),
+            PathBuf::from("/source/b.txt"),
+        ];
+        let mut bookmarks = crate::core::bookmarks::Bookmarks::default();
+        let mut toasts = crate::ui::toasts::Toasts::default();
+
+        let outcome = super::App::handle_file_actions(
+            vec![crate::ui::file_list::FileListAction::DragStarted(
+                paths.clone(),
+            )],
+            &mut bookmarks,
+            &mut toasts,
+            crate::core::config::TerminalApp::Auto,
+        );
+
+        assert_eq!(outcome.drag_started, Some(paths));
+        assert!(outcome.internal_drop.is_none());
+    }
+
+    #[test]
+    fn one_action_batch_selects_only_one_explicit_drop() {
+        let paths = vec![PathBuf::from("/source/item.txt")];
+        let first_destination = PathBuf::from("/destination/folder-row");
+        let mut bookmarks = crate::core::bookmarks::Bookmarks::default();
+        let mut toasts = crate::ui::toasts::Toasts::default();
+
+        let outcome = super::App::handle_file_actions(
+            vec![
+                crate::ui::file_list::FileListAction::MoveItems(
+                    paths.clone(),
+                    first_destination.clone(),
+                ),
+                crate::ui::file_list::FileListAction::MoveItems(
+                    paths.clone(),
+                    PathBuf::from("/destination/pane-root"),
+                ),
+            ],
+            &mut bookmarks,
+            &mut toasts,
+            crate::core::config::TerminalApp::Auto,
+        );
+
+        assert_eq!(
+            outcome.internal_drop,
+            Some(InternalFileDrop {
+                paths,
+                destination: first_destination,
+            })
         );
     }
 

@@ -53,7 +53,7 @@ pub fn show(
     bookmarks: &mut Bookmarks,
     global_tags: &GlobalTags,
     current_path: &PathBuf,
-    dragging_paths: &Option<Vec<PathBuf>>,
+    dragging_paths: Option<&[PathBuf]>,
     active_tag: Option<&str>,
     new_tag_input: &mut String,
     new_tag_color: &mut u8,
@@ -128,7 +128,7 @@ pub fn show(
             if pointer_released {
                 if let Some(from) = dragging_paths {
                     actions.push(SidebarAction::MoveFilesTo(
-                        from.clone(),
+                        from.to_vec(),
                         bookmark.path.clone(),
                     ));
                     bookmark_drop_handled = true;
