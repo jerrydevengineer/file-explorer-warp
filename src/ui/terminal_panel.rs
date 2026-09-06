@@ -15,6 +15,21 @@ const FONT_SIZE: f32 = 13.0;
 const DEFAULT_FG: Color32 = Color32::from_rgb(204, 204, 204);
 const DEFAULT_BG: Color32 = Color32::from_rgb(28, 28, 28);
 const SELECTION_BG: Color32 = Color32::from_rgb(48, 96, 160);
+const HEADER_LEFT_WIDTH: f32 = 38.0;
+const HEADER_RIGHT_WIDTH: f32 = 174.0;
+
+fn terminal_header_rects(header: Rect) -> (Rect, Rect, Rect) {
+    let left_edge = (header.left() + HEADER_LEFT_WIDTH).min(header.right());
+    let right_edge = (header.right() - HEADER_RIGHT_WIDTH).max(left_edge);
+    (
+        Rect::from_min_max(header.min, Pos2::new(left_edge, header.bottom())),
+        Rect::from_min_max(
+            Pos2::new(left_edge, header.top()),
+            Pos2::new(right_edge, header.bottom()),
+        ),
+        Rect::from_min_max(Pos2::new(right_edge, header.top()), header.max),
+    )
+}
 
 // ── Selection state ───────────────────────────────────────────────────────────
 
@@ -123,6 +138,7 @@ pub fn show(
     if terminals.is_empty() {
         return None;
     }
+    let active = active.min(terminals.len() - 1);
 
     let mut event: Option<TerminalPanelEvent> = None;
     let font_id = FontId::new(
@@ -136,65 +152,82 @@ pub fn show(
     });
 
     // ── Header: tab bar ───────────────────────────────────────────────────────
-    ui.horizontal(|ui| {
-        ui.add_space(4.0);
+    let header_height = ui.spacing().interact_size.y;
+    let (header_rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), header_height),
+        Sense::hover(),
+    );
+    let (new_tab_rect, tabs_rect, actions_rect) = terminal_header_rects(header_rect);
 
-        // Keep New Tab before variable-width titles so it remains reachable
-        // even when a shell reports a very long title or many tabs are open.
-        if ui
-            .small_button("+")
-            .on_hover_text("New terminal tab (opens in current directory)")
-            .clicked()
-            && event.is_none()
-        {
-            event = Some(TerminalPanelEvent::NewTab);
-        }
-        ui.separator();
-
-        // One button per tab; active tab is highlighted
-        for (i, term) in terminals.iter().enumerate() {
-            let title = {
-                let g = term.grid.lock().unwrap();
-                if g.title.is_empty() {
-                    "zsh".to_string()
-                } else {
-                    display_text::normalize(&g.title)
-                }
-            };
-
-            // Tab label — acts as a switch button
-            let resp = ui.selectable_label(i == active, &title);
-            if resp.clicked() && i != active && event.is_none() {
-                event = Some(TerminalPanelEvent::SwitchTab(i));
+    // Fixed left control: terminal titles can never push New Tab out of reach.
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(new_tab_rect), |ui| {
+        ui.set_clip_rect(new_tab_rect);
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.add_space(4.0);
+            if ui
+                .small_button("+")
+                .on_hover_text("New terminal tab (opens in current directory)")
+                .clicked()
+                && event.is_none()
+            {
+                event = Some(TerminalPanelEvent::NewTab);
             }
+        });
+    });
 
-            // Close button only when there is more than one tab
-            if terminals.len() > 1 {
-                let close = ui.small_button("×").on_hover_text("Close tab");
-                if close.clicked() && event.is_none() {
-                    event = Some(TerminalPanelEvent::CloseTab(i));
-                }
-            }
+    // Variable-width titles scroll only inside the middle viewport.
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(tabs_rect), |ui| {
+        ui.set_clip_rect(tabs_rect);
+        egui::ScrollArea::horizontal()
+            .id_salt("terminal_tabs_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, term) in terminals.iter().enumerate() {
+                        let title = {
+                            let g = term.grid.lock().unwrap();
+                            if g.title.is_empty() {
+                                "zsh".to_string()
+                            } else {
+                                display_text::normalize(&g.title)
+                            }
+                        };
 
-            ui.add_space(2.0);
-        }
+                        let resp = ui.selectable_label(i == active, &title);
+                        if resp.clicked() && i != active && event.is_none() {
+                            event = Some(TerminalPanelEvent::SwitchTab(i));
+                        }
 
-        // CWD of the active tab — shown after the tab list
-        let cwd_str = {
-            let g = terminals[active].grid.lock().unwrap();
-            g.cwd.as_deref().map(display_text::path).unwrap_or_default()
-        };
-        if !cwd_str.is_empty() {
-            ui.separator();
-            ui.label(egui::RichText::new(&cwd_str).small().weak());
-        }
+                        // Closing and hiding are deliberately different: every
+                        // terminal session, including the final one, is closable.
+                        let close = ui.small_button("×").on_hover_text("Close terminal tab");
+                        if close.clicked() && event.is_none() {
+                            event = Some(TerminalPanelEvent::CloseTab(i));
+                        }
+                        ui.add_space(2.0);
+                    }
 
-        // Right-aligned buttons
+                    let cwd_str = {
+                        let g = terminals[active].grid.lock().unwrap();
+                        g.cwd.as_deref().map(display_text::path).unwrap_or_default()
+                    };
+                    if !cwd_str.is_empty() {
+                        ui.separator();
+                        ui.label(egui::RichText::new(&cwd_str).small().weak());
+                    }
+                });
+            });
+    });
+
+    // Fixed right controls remain available regardless of title length/count.
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(actions_rect), |ui| {
+        ui.set_clip_rect(actions_rect);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(4.0);
             ui.label(egui::RichText::new("⌘J").small().weak());
             ui.separator();
-            if ui.small_button("↗ Open in Terminal")
+            if ui
+                .small_button("↗ Open in Terminal")
                 .on_hover_text("Open current directory in external terminal (Warp/iTerm)")
                 .clicked()
                 && event.is_none()
@@ -782,7 +815,8 @@ fn special_seq(key: egui::Key) -> Option<Vec<u8>> {
 mod tests {
     use super::{
         collect_terminal_input, extract_selection_text, selection_contains_glyph,
-        TermSelection, TerminalImeState,
+        terminal_header_rects, TermSelection, TerminalImeState, HEADER_LEFT_WIDTH,
+        HEADER_RIGHT_WIDTH,
     };
     use crate::core::terminal::{TermPerformer, TerminalGrid};
 
@@ -861,6 +895,19 @@ mod tests {
 
         assert_eq!(bytes, b"cargo run");
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn terminal_titles_cannot_expand_over_fixed_header_controls() {
+        let header =
+            egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(600.0, 24.0));
+        let (new_tab, titles, actions) = terminal_header_rects(header);
+
+        assert_eq!(new_tab.width(), HEADER_LEFT_WIDTH);
+        assert_eq!(actions.width(), HEADER_RIGHT_WIDTH);
+        assert_eq!(titles.left(), new_tab.right());
+        assert_eq!(titles.right(), actions.left());
+        assert_eq!(new_tab.union(titles).union(actions), header);
     }
 
     #[cfg(target_os = "macos")]

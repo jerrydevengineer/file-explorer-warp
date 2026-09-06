@@ -729,6 +729,7 @@ pub struct TerminalState {
     pub grid: Arc<Mutex<TerminalGrid>>,
     writer: Box<dyn Write + Send>,
     master: Box<dyn portable_pty::MasterPty + Send>,
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
 }
 
 impl TerminalState {
@@ -762,7 +763,8 @@ impl TerminalState {
             cmd.env_remove("TERM_SESSION_ID");
             cmd.env_remove("SHELL_SESSION_ID");
         }
-        pair.slave
+        let child = pair
+            .slave
             .spawn_command(cmd)
             .context("could not start zsh in pseudo-terminal")?;
 
@@ -796,7 +798,12 @@ impl TerminalState {
             .master
             .take_writer()
             .context("could not open pseudo-terminal writer")?;
-        Ok(Self { grid, writer, master: pair.master })
+        Ok(Self {
+            grid,
+            writer,
+            master: pair.master,
+            child: Some(child),
+        })
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -814,12 +821,107 @@ impl TerminalState {
     pub fn write_input(&mut self, bytes: &[u8]) {
         let _ = self.writer.write_all(bytes);
     }
+
+    /// Request termination without waiting on the UI thread. Taking the child
+    /// handle makes repeated calls harmless and lets closing a terminal tab
+    /// release its PTY resources immediately.
+    pub fn terminate(&mut self) {
+        terminate_child_nonblocking(&mut self.child);
+    }
+}
+
+fn terminate_child_nonblocking(
+    child_slot: &mut Option<Box<dyn portable_pty::Child + Send + Sync>>,
+) {
+    let Some(mut child) = child_slot.take() else {
+        return;
+    };
+
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+
+    let process_id = child.process_id();
+    let spawn_result = std::thread::Builder::new()
+        .name("terminal-child-terminator".to_string())
+        .spawn(move || {
+            if let Err(error) = child.kill() {
+                eprintln!("[terminal] child termination failed: pid={process_id:?} error={error}");
+                return;
+            }
+            if let Err(error) = child.wait() {
+                eprintln!("[terminal] child reap failed: pid={process_id:?} error={error}");
+            }
+        });
+
+    if let Err(error) = spawn_result {
+        eprintln!("[terminal] could not start child terminator: {error}");
+    }
+}
+
+impl Drop for TerminalState {
+    fn drop(&mut self) {
+        self.terminate();
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_osc7_path, TermPerformer, TerminalGrid};
+    use super::{parse_osc7_path, terminate_child_nonblocking, TermPerformer, TerminalGrid};
+    use portable_pty::{Child, ChildKiller, ExitStatus};
     use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct MockChild {
+        killed: mpsc::Sender<()>,
+    }
+
+    #[derive(Debug)]
+    struct MockChildKiller {
+        killed: mpsc::Sender<()>,
+    }
+
+    impl ChildKiller for MockChildKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            let _ = self.killed.send(());
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(Self {
+                killed: self.killed.clone(),
+            })
+        }
+    }
+
+    impl ChildKiller for MockChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            let _ = self.killed.send(());
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(MockChildKiller {
+                killed: self.killed.clone(),
+            })
+        }
+    }
+
+    impl Child for MockChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> std::io::Result<ExitStatus> {
+            Ok(ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(42)
+        }
+    }
 
     fn feed(grid: &mut TerminalGrid, text: &str) {
         let mut parser = vte::Parser::new();
@@ -827,6 +929,23 @@ mod tests {
         for byte in text.as_bytes() {
             parser.advance(&mut performer, *byte);
         }
+    }
+
+    #[test]
+    fn child_termination_is_backgrounded_and_idempotent() {
+        let (killed_tx, killed_rx) = mpsc::channel();
+        let mut child: Option<Box<dyn Child + Send + Sync>> =
+            Some(Box::new(MockChild { killed: killed_tx }));
+
+        terminate_child_nonblocking(&mut child);
+
+        assert!(child.is_none());
+        killed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("background terminator should kill the child");
+
+        terminate_child_nonblocking(&mut child);
+        assert!(killed_rx.recv_timeout(Duration::from_millis(25)).is_err());
     }
 
     fn assert_no_orphan_continuations(grid: &TerminalGrid, row: usize) {

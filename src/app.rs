@@ -553,6 +553,86 @@ fn browser_to_terminal_sync_command(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalToggleAction {
+    Hide,
+    ShowExisting,
+    SpawnAndShow,
+}
+
+fn terminal_toggle_action(terminal_open: bool, terminal_count: usize) -> TerminalToggleAction {
+    if terminal_open {
+        TerminalToggleAction::Hide
+    } else if terminal_count == 0 {
+        TerminalToggleAction::SpawnAndShow
+    } else {
+        TerminalToggleAction::ShowExisting
+    }
+}
+
+fn terminal_active_after_append(terminal_count: usize) -> usize {
+    terminal_count.saturating_sub(1)
+}
+
+fn terminal_active_after_close(
+    active: usize,
+    terminal_count: usize,
+    closed: usize,
+) -> Option<usize> {
+    if terminal_count == 0 || closed >= terminal_count {
+        return terminal_count.checked_sub(1).map(|last| active.min(last));
+    }
+
+    let remaining = terminal_count - 1;
+    if remaining == 0 {
+        return None;
+    }
+
+    let next = if active > closed {
+        active - 1
+    } else if active == closed {
+        closed.min(remaining - 1)
+    } else {
+        active
+    };
+    Some(next.min(remaining - 1))
+}
+
+fn terminal_toggle_key_event(event: &egui::Event) -> Option<bool> {
+    let egui::Event::Key {
+        key: egui::Key::J,
+        pressed: true,
+        repeat,
+        modifiers,
+        ..
+    } = event
+    else {
+        return None;
+    };
+
+    if modifiers.command && !modifiers.shift && !modifiers.alt && !modifiers.ctrl {
+        Some(*repeat)
+    } else {
+        None
+    }
+}
+
+/// Remove the app-level terminal toggle before the focused terminal grid can
+/// observe it. Repeated key-down events are consumed but do not toggle again.
+fn take_terminal_toggle_shortcut(events: &mut Vec<egui::Event>) -> bool {
+    let mut toggle = false;
+    events.retain(|event| {
+        let Some(repeat) = terminal_toggle_key_event(event) else {
+            return true;
+        };
+        if !repeat {
+            toggle = true;
+        }
+        false
+    });
+    toggle
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TabCycleDirection {
     Previous,
     Next,
@@ -1046,27 +1126,122 @@ impl App {
         let _ = self.drain_terminal_cwd_updates();
     }
 
-    fn toggle_terminal(&mut self, ctx: &egui::Context) {
-        if self.terminal_open {
+    fn normalize_terminal_tabs(&mut self) {
+        if self.terminals.is_empty() {
+            self.terminal_active = 0;
             self.terminal_open = false;
-            self.reset_terminal_cwd_sync_tracking();
+            self.terminal_last_sync_path = None;
         } else {
-            if self.terminals.is_empty() {
-                let cwd = self.focused_pane().active().current_path.clone();
-                let ctx2 = ctx.clone();
-                match TerminalState::spawn(80, 24, &cwd, Arc::new(move || ctx2.request_repaint())) {
-                    Ok(t) => {
-                        self.terminals.push(t);
-                        self.terminal_active = 0;
-                    }
-                    Err(_) => {
-                        return;
-                    }
+            self.terminal_active = self.terminal_active.min(self.terminals.len() - 1);
+        }
+    }
+
+    fn spawn_terminal_tab(&mut self, ctx: &egui::Context, operation: &'static str) -> bool {
+        eprintln!(
+            "[terminal] spawn requested: operation={operation} count={} active={}",
+            self.terminals.len(),
+            self.terminal_active,
+        );
+        let cwd = self.focused_pane().active().current_path.clone();
+        let repaint_ctx = ctx.clone();
+        match TerminalState::spawn(
+            80,
+            24,
+            &cwd,
+            Arc::new(move || repaint_ctx.request_repaint()),
+        ) {
+            Ok(terminal) => {
+                self.terminals.push(terminal);
+                self.terminal_active = terminal_active_after_append(self.terminals.len());
+                self.terminal_open = true;
+                self.terminal_last_sync_path = None;
+                eprintln!(
+                    "[terminal] spawn succeeded: operation={operation} count={} active={}",
+                    self.terminals.len(),
+                    self.terminal_active,
+                );
+                true
+            }
+            Err(error) => {
+                self.normalize_terminal_tabs();
+                eprintln!("[terminal] spawn failed: operation={operation} error={error:#}");
+                self.toasts
+                    .push(format!("Could not open a terminal tab: {error}"));
+                false
+            }
+        }
+    }
+
+    fn close_terminal_tab(&mut self, index: usize) {
+        eprintln!(
+            "[terminal] close requested: index={index} count={} active={}",
+            self.terminals.len(),
+            self.terminal_active,
+        );
+        if index >= self.terminals.len() {
+            self.normalize_terminal_tabs();
+            eprintln!(
+                "[terminal] close ignored: invalid index={index} count={} active={}",
+                self.terminals.len(),
+                self.terminal_active,
+            );
+            return;
+        }
+
+        let next_active =
+            terminal_active_after_close(self.terminal_active, self.terminals.len(), index);
+        let mut terminal = self.terminals.remove(index);
+        terminal.terminate();
+
+        match next_active {
+            Some(active) => {
+                self.terminal_active = active;
+                if self.config.terminal_cwd_sync {
+                    self.terminal_last_sync_path = None;
                 }
             }
-            self.terminal_open = true;
-            self.terminal_last_sync_path = None;
-            self.sync_browser_cwd_to_active_terminal();
+            None => {
+                self.terminal_active = 0;
+                self.terminal_open = false;
+                self.terminal_last_sync_path = None;
+            }
+        }
+        self.normalize_terminal_tabs();
+        eprintln!(
+            "[terminal] close completed: count={} active={} panel_open={}",
+            self.terminals.len(),
+            self.terminal_active,
+            self.terminal_open,
+        );
+    }
+
+    fn toggle_terminal(&mut self, ctx: &egui::Context) {
+        match terminal_toggle_action(self.terminal_open, self.terminals.len()) {
+            TerminalToggleAction::Hide => {
+                eprintln!(
+                    "[terminal] panel hidden: count={} active={}",
+                    self.terminals.len(),
+                    self.terminal_active,
+                );
+                self.terminal_open = false;
+                self.reset_terminal_cwd_sync_tracking();
+            }
+            TerminalToggleAction::ShowExisting => {
+                self.normalize_terminal_tabs();
+                self.terminal_open = true;
+                self.terminal_last_sync_path = None;
+                self.sync_browser_cwd_to_active_terminal();
+                eprintln!(
+                    "[terminal] panel shown: count={} active={}",
+                    self.terminals.len(),
+                    self.terminal_active,
+                );
+            }
+            TerminalToggleAction::SpawnAndShow => {
+                if self.spawn_terminal_tab(ctx, "toggle-empty-panel") {
+                    self.sync_browser_cwd_to_active_terminal();
+                }
+            }
         }
     }
 
@@ -2031,9 +2206,6 @@ impl eframe::App for App {
             if i.modifiers.command && i.key_pressed(egui::Key::G) {
                 kb_toggle_git = true;
             }
-            if i.modifiers.command && i.key_pressed(egui::Key::J) {
-                kb_toggle_terminal = true;
-            }
             if i.modifiers.command && i.key_pressed(egui::Key::N) {
                 kb_new_window = true;
             }
@@ -2094,6 +2266,7 @@ impl eframe::App for App {
 
         // Space must be consumed via input_mut so the ScrollArea never sees it.
         ctx.input_mut(|i| {
+            kb_toggle_terminal = take_terminal_toggle_shortcut(&mut i.events);
             kb_cycle_tab = take_tab_cycle_shortcut(&mut i.events);
             if file_shortcuts_active && i.consume_key(egui::Modifiers::NONE, egui::Key::Space) {
                 kb_quicklook = true;
@@ -2579,53 +2752,17 @@ impl eframe::App for App {
                             opener::open_in_terminal(&cwd, terminal_app_pref);
                         }
                         Some(TerminalPanelEvent::NewTab) => {
-                            eprintln!("[terminal] new-tab requested");
-                            let cwd = self.focused_pane().active().current_path.clone();
-                            let ctx2 = ctx.clone();
-                            match TerminalState::spawn(
-                                80,
-                                24,
-                                &cwd,
-                                Arc::new(move || ctx2.request_repaint()),
-                            ) {
-                                Ok(t) => {
-                                    self.terminals.push(t);
-                                    self.terminal_active = self.terminals.len() - 1;
-                                    if self.config.terminal_cwd_sync {
-                                        self.terminal_last_sync_path = None;
-                                    }
-                                    eprintln!(
-                                        "[terminal] spawn succeeded: count={} active={}",
-                                        self.terminals.len(),
-                                        self.terminal_active,
-                                    );
-                                }
-                                Err(error) => {
-                                    eprintln!("[terminal] spawn failed: {error:#}");
-                                    self.toasts.push(format!(
-                                        "Could not open a new terminal tab: {error}"
-                                    ));
-                                }
-                            }
+                            self.spawn_terminal_tab(ctx, "new-tab-button");
                         }
                         Some(TerminalPanelEvent::CloseTab(idx)) => {
-                            self.terminals.remove(idx);
-                            if self.terminals.is_empty() {
-                                self.terminal_open = false;
-                                self.terminal_last_sync_path = None;
-                            } else {
-                                if self.terminal_active >= self.terminals.len() {
-                                    self.terminal_active = self.terminals.len() - 1;
-                                }
+                            self.close_terminal_tab(idx);
+                        }
+                        Some(TerminalPanelEvent::SwitchTab(idx)) => {
+                            if idx < self.terminals.len() {
+                                self.terminal_active = idx;
                                 if self.config.terminal_cwd_sync {
                                     self.terminal_last_sync_path = None;
                                 }
-                            }
-                        }
-                        Some(TerminalPanelEvent::SwitchTab(idx)) => {
-                            self.terminal_active = idx;
-                            if self.config.terminal_cwd_sync {
-                                self.terminal_last_sync_path = None;
                             }
                         }
                         None => {}
@@ -3753,8 +3890,10 @@ mod clipboard_tests {
         file_list_owns_keyboard_commands, internal_drop_reload_dirs, move_error_message, move_path,
         paste_paths, paste_reload_dirs, push_unique_path, resolve_internal_file_drop,
         restore_browser_session, tab_cycle_key_event, take_tab_cycle_shortcut,
-        terminal_to_browser_sync_target, update_pending_session, ClipboardKind, ExternalDragResult,
-        FileDragState, InternalFileDrop, PaneSide, PaneState, TabCycleDirection, TabState,
+        take_terminal_toggle_shortcut, terminal_active_after_append,
+        terminal_active_after_close, terminal_to_browser_sync_target, terminal_toggle_action,
+        update_pending_session, ClipboardKind, ExternalDragResult, FileDragState, InternalFileDrop,
+        PaneSide, PaneState, TabCycleDirection, TabState, TerminalToggleAction,
         SESSION_SAVE_DEBOUNCE,
     };
     use crate::core::session::{
@@ -4264,6 +4403,66 @@ mod clipboard_tests {
         )];
 
         assert_eq!(take_tab_cycle_shortcut(&mut events), None);
+        assert!(events.is_empty());
+    }
+
+    fn terminal_toggle_event(repeat: bool) -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::J,
+            physical_key: Some(egui::Key::J),
+            pressed: true,
+            repeat,
+            modifiers: egui::Modifiers {
+                mac_cmd: true,
+                command: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn terminal_close_selects_a_valid_neighbor_and_append_selects_the_new_tab() {
+        assert_eq!(terminal_active_after_close(1, 2, 1), Some(0));
+        assert_eq!(terminal_active_after_append(2), 1);
+        assert_eq!(terminal_active_after_close(1, 3, 1), Some(1));
+        assert_eq!(terminal_active_after_close(2, 3, 0), Some(1));
+    }
+
+    #[test]
+    fn closing_the_final_terminal_has_no_active_index() {
+        assert_eq!(terminal_active_after_close(0, 1, 0), None);
+    }
+
+    #[test]
+    fn terminal_toggle_preserves_sessions_and_requests_spawn_only_when_empty() {
+        assert_eq!(terminal_toggle_action(true, 2), TerminalToggleAction::Hide);
+        assert_eq!(
+            terminal_toggle_action(false, 2),
+            TerminalToggleAction::ShowExisting
+        );
+        assert_eq!(
+            terminal_toggle_action(false, 0),
+            TerminalToggleAction::SpawnAndShow
+        );
+    }
+
+    #[test]
+    fn terminal_toggle_is_consumed_before_terminal_input() {
+        let mut events = vec![
+            egui::Event::Text("unrelated".to_string()),
+            terminal_toggle_event(false),
+        ];
+
+        assert!(take_terminal_toggle_shortcut(&mut events));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], egui::Event::Text(text) if text == "unrelated"));
+    }
+
+    #[test]
+    fn repeated_terminal_toggle_is_consumed_without_toggling_again() {
+        let mut events = vec![terminal_toggle_event(true)];
+
+        assert!(!take_terminal_toggle_shortcut(&mut events));
         assert!(events.is_empty());
     }
 
